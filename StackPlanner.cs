@@ -538,6 +538,9 @@ public sealed class StackPlanner
             null);
         if (boxes.Count == 0) return initial;
 
+        // 同一规划调用内，同箱型优先复用一层相对布局；模板只作为快路径，
+        // 不能替代后续的边界、碰撞和支撑校验。
+        var layerTemplates = new Dictionary<string, LayerTemplate>(StringComparer.Ordinal);
         var frontier = new[] { initial };
         SearchState best = initial;
         for (int depth = 0; depth < boxes.Count && frontier.Length > 0; depth++)
@@ -574,6 +577,19 @@ public sealed class StackPlanner
                         placements,
                         candidate.Placement.LayerIndex,
                         BoxTypeKey(box)));
+
+                    // 模板批量分支只增加一个候选搜索状态；普通单箱分支始终保留，
+                    // 因此模板不适用时不会改变原有规划能力。
+                    string typeKey = BoxTypeKey(box);
+                    if (!layerTemplates.TryGetValue(typeKey, out var template))
+                    {
+                        template = BuildLayerTemplate(box);
+                        layerTemplates[typeKey] = template;
+                    }
+                    var bulkState = TryApplyLayerTemplate(
+                        state, box, candidate, template, remaining);
+                    if (bulkState is not null)
+                        next.Add(bulkState);
                 }
             }
 
@@ -607,6 +623,127 @@ public sealed class StackPlanner
             .ThenBy(SearchBoundingArea)
             .ThenBy(SearchSignature, StringComparer.Ordinal)
             .First();
+    }
+
+    /// <summary>
+    /// 使用代表箱子在空托盘上生成一个确定性的底层布局模板。
+    /// 模板只保存同层相对位置，实际套用时仍需重新检查当前支撑面。
+    /// </summary>
+    private LayerTemplate BuildLayerTemplate(Box box)
+    {
+        var occupied = new List<PlacedBox>();
+        var slots = new List<LayerTemplateSlot>();
+        while (true)
+        {
+            var candidate = GenerateCandidates(box, occupied)
+                .FirstOrDefault(x => x.Placement.LayerIndex == 0 && x.Candidate.BaseZ <= Epsilon);
+            if (candidate is null) break;
+
+            var placed = ToPlacedBox(box, candidate.Placement, false);
+            if (!Fits(placed, occupied)) break;
+            occupied.Add(placed);
+            slots.Add(new LayerTemplateSlot(
+                candidate.Placement.Xmm,
+                candidate.Placement.Ymm,
+                candidate.Placement.OrientationDeg));
+        }
+
+        if (slots.Count == 0)
+            return new LayerTemplate(Array.Empty<LayerTemplateSlot>());
+
+        var anchor = slots[0];
+        return new LayerTemplate(slots.Select(x => new LayerTemplateSlot(
+            x.RelativeX - anchor.RelativeX,
+            x.RelativeY - anchor.RelativeY,
+            x.OrientationDeg)).ToArray());
+    }
+
+    /// <summary>
+    /// 将一层模板绑定到当前候选箱子，并批量生成同箱型箱子的搜索状态。
+    /// 任一槽位不合法时不提交部分结果，由普通搜索分支继续处理。
+    /// </summary>
+    private SearchState? TryApplyLayerTemplate(
+        SearchState state,
+        Box anchorBox,
+        CandidatePlacement anchor,
+        LayerTemplate template,
+        IReadOnlyList<Box> remaining)
+    {
+        if (template.Slots.Count < 2)
+            return null;
+        if (template.Slots[0].OrientationDeg != anchor.Placement.OrientationDeg)
+            return null;
+
+        var sameType = remaining
+            .Where(x => string.Equals(BoxTypeKey(x), BoxTypeKey(anchorBox), StringComparison.Ordinal))
+            .OrderBy(x => x.Order)
+            .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
+            .Take(template.Slots.Count - 1)
+            .ToArray();
+        if (sameType.Length == 0)
+            return null;
+
+        var occupied = state.Occupied.ToList();
+        var placements = new Dictionary<string, BoxPlacement>(state.Placements, StringComparer.Ordinal)
+        {
+            [anchorBox.BoxNumber] = anchor.Placement,
+        };
+        occupied.Add(ToPlacedBox(anchorBox, anchor.Placement, false));
+        var usedNumbers = new HashSet<string>(StringComparer.Ordinal) { anchorBox.BoxNumber };
+
+        for (int index = 0; index < sameType.Length; index++)
+        {
+            var box = sameType[index];
+            var slot = template.Slots[index + 1];
+            var candidate = new Candidate(
+                anchor.Placement.Xmm + slot.RelativeX,
+                anchor.Placement.Ymm + slot.RelativeY,
+                anchor.Candidate.BaseZ,
+                slot.OrientationDeg == 0 ? box.WidthMm : box.LengthMm,
+                slot.OrientationDeg == 0 ? box.LengthMm : box.WidthMm,
+                box.HeightMm,
+                slot.OrientationDeg);
+
+            if (!InsidePallet(candidate) || Collides(candidate, occupied))
+                return null;
+
+            var supports = Supporting(candidate, occupied);
+            if (candidate.BaseZ > Epsilon
+                && (supports.Count == 0 || !HasStableSupport(candidate, supports)))
+                return null;
+
+            int layer = candidate.BaseZ <= Epsilon
+                ? 0
+                : supports.Max(x => x.Placement.LayerIndex) + 1;
+            if (layer != anchor.Placement.LayerIndex)
+                return null;
+
+            var placement = new BoxPlacement
+            {
+                Order = box.Order,
+                BoxNumber = box.BoxNumber,
+                Xmm = Round(candidate.X),
+                Ymm = Round(candidate.Y),
+                Zmm = Round(PlaceFloorZMm - candidate.BaseZ - box.HeightMm),
+                OrientationDeg = slot.OrientationDeg,
+                LayerIndex = layer,
+            };
+            var placed = ToPlacedBox(box, placement, false);
+            if (!Fits(placed, occupied))
+                return null;
+
+            occupied.Add(placed);
+            placements[box.BoxNumber] = placement;
+            usedNumbers.Add(box.BoxNumber);
+        }
+
+        var nextRemaining = remaining.Where(x => !usedNumbers.Contains(x.BoxNumber)).ToArray();
+        return new SearchState(
+            nextRemaining,
+            occupied.ToArray(),
+            placements,
+            anchor.Placement.LayerIndex,
+            BoxTypeKey(anchorBox));
     }
 
     /// <summary>
@@ -741,8 +878,19 @@ public sealed class StackPlanner
     /// </summary>
     private BoxChoice? SelectNextBox(SearchState state)
     {
+        // 候选几何只由箱子尺寸、朝向和当前占用决定，与箱号及 Order 无关。
+        // 相同箱型只为确定性代表箱生成一次候选，避免 128 个相同箱子在每个搜索状态
+        // 中重复执行完全相同的边界、碰撞和支撑计算。
         var candidatesByBox = state.Remaining
-            .Select(box => new SearchBoxCandidates(box, GenerateCandidates(box, state.Occupied)))
+            .GroupBy(BoxTypeKey, StringComparer.Ordinal)
+            .Select(group =>
+            {
+                var box = group
+                    .OrderBy(x => x.Order)
+                    .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
+                    .First();
+                return new SearchBoxCandidates(box, GenerateCandidates(box, state.Occupied));
+            })
             .ToArray();
         int currentLayer = candidatesByBox
             .SelectMany(x => x.Candidates)
@@ -900,4 +1048,8 @@ public sealed class StackPlanner
 
     private sealed record SearchBoxCandidates(Box Box, IReadOnlyList<CandidatePlacement> Candidates);
     private sealed record BoxChoice(Box Box, IReadOnlyList<CandidatePlacement> Candidates);
+    /// <summary>同箱型一层布局的相对槽位。</summary>
+    private sealed record LayerTemplateSlot(double RelativeX, double RelativeY, int OrientationDeg);
+    /// <summary>同箱型一层布局模板，不包含具体箱号和绝对高度。</summary>
+    private sealed record LayerTemplate(IReadOnlyList<LayerTemplateSlot> Slots);
 }
