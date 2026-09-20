@@ -25,9 +25,14 @@ public sealed class StackPlanner
     /// <summary>几何比较使用的固定误差，避免浮点边界导致结果不稳定。</summary>
     private const double Epsilon = 0.0001;
     /// <summary>有限宽度搜索每一轮最多保留的布局数量。</summary>
-    private const int BeamWidth = 64;
+    private const int BeamWidth = 96;
     /// <summary>单个箱子最多保留的候选位置数量。</summary>
-    private const int MaxCandidatesPerBox = 32;
+    private const int MaxCandidatesPerBox = 64;
+    private double _palletXMinMm;
+    private double _palletXMaxMm;
+    private double _palletYMinMm;
+    private double _palletYMaxMm;
+    private bool _hasGeneratedPlan;
     /// <summary>DLL 当前维护的全部箱子。</summary>
     private readonly BoxGroup _group = new();
     /// <summary>已实际堆垛成功箱子的固定位置，不允许普通重规划改变。</summary>
@@ -36,6 +41,78 @@ public sealed class StackPlanner
     private readonly Dictionary<string, BoxPlacement> _lastPlacements = new(StringComparer.Ordinal);
     /// <summary>对外返回的最近一次规划结果。</summary>
     private StackPlanResult _lastPlan = new() { Placements = Array.Empty<BoxPlacement>(), PlanningResult = true };
+
+    /// <summary>
+    /// 使用默认托盘边界创建规划器。
+    /// 托盘边界在实例创建后不可修改，保证一次任务内规划结果的坐标系稳定。
+    /// </summary>
+    public StackPlanner()
+        : this(PalletXMinMm, PalletXMaxMm, PalletYMinMm, PalletYMaxMm)
+    {
+    }
+
+    /// <summary>
+    /// 使用指定托盘边界创建规划器。边界单位为 mm，且必须在首次规划前确定。
+    /// </summary>
+    public StackPlanner(
+        double palletXMinMm,
+        double palletXMaxMm,
+        double palletYMinMm,
+        double palletYMaxMm)
+    {
+        ValidatePalletDimensions(palletXMinMm, palletXMaxMm, palletYMinMm, palletYMaxMm);
+
+        _palletXMinMm = palletXMinMm;
+        _palletXMaxMm = palletXMaxMm;
+        _palletYMinMm = palletYMinMm;
+        _palletYMaxMm = palletYMaxMm;
+    }
+
+    private static void ValidatePalletDimensions(
+        double palletXMinMm,
+        double palletXMaxMm,
+        double palletYMinMm,
+        double palletYMaxMm)
+    {
+        if (!double.IsFinite(palletXMinMm) || !double.IsFinite(palletXMaxMm)
+            || !double.IsFinite(palletYMinMm) || !double.IsFinite(palletYMaxMm)
+            || palletXMaxMm <= palletXMinMm || palletYMaxMm <= palletYMinMm)
+            throw new ArgumentException("托盘边界必须为有限数值，且最大值必须大于最小值。");
+    }
+
+    /// <summary>当前规划器使用的托盘 X 最小边界，单位为 mm。</summary>
+    public double PalletXMin => _palletXMinMm;
+    /// <summary>当前规划器使用的托盘 X 最大边界，单位为 mm。</summary>
+    public double PalletXMax => _palletXMaxMm;
+    /// <summary>当前规划器使用的托盘 Y 最小边界，单位为 mm。</summary>
+    public double PalletYMin => _palletYMinMm;
+    /// <summary>当前规划器使用的托盘 Y 最大边界，单位为 mm。</summary>
+    public double PalletYMax => _palletYMaxMm;
+
+    /// <summary>
+    /// 设置当前任务的托盘边界。必须在首次成功生成规划前调用，规划完成后不能修改。
+    /// </summary>
+    /// <param name="palletXMinMm">托盘 X 最小边界，单位为 mm。</param>
+    /// <param name="palletXMaxMm">托盘 X 最大边界，单位为 mm。</param>
+    /// <param name="palletYMinMm">托盘 Y 最小边界，单位为 mm。</param>
+    /// <param name="palletYMaxMm">托盘 Y 最大边界，单位为 mm。</param>
+    /// <exception cref="InvalidOperationException">规划已经生成，不能修改托盘尺寸。</exception>
+    /// <exception cref="ArgumentException">托盘边界不是有限值或最大值不大于最小值。</exception>
+    public void SetPalletDimensions(
+        double palletXMinMm,
+        double palletXMaxMm,
+        double palletYMinMm,
+        double palletYMaxMm)
+    {
+        if (_hasGeneratedPlan)
+            throw new InvalidOperationException("规划已经生成，不能修改托盘尺寸。");
+
+        ValidatePalletDimensions(palletXMinMm, palletXMaxMm, palletYMinMm, palletYMaxMm);
+        _palletXMinMm = palletXMinMm;
+        _palletXMaxMm = palletXMaxMm;
+        _palletYMinMm = palletYMinMm;
+        _palletYMaxMm = palletYMaxMm;
+    }
 
     /// <summary>
     /// 获取当前箱子集合的副本。调用方修改返回对象不会影响 DLL 内部状态。
@@ -114,6 +191,7 @@ public sealed class StackPlanner
         _succeeded.Clear();
         _lastPlacements.Clear();
         _lastPlan = new StackPlanResult { Placements = Array.Empty<BoxPlacement>(), PlanningResult = true };
+        _hasGeneratedPlan = false;
     }
 
     /// <summary>
@@ -310,6 +388,7 @@ public sealed class StackPlanner
         _lastPlacements.Clear();
         foreach (var placement in placements) _lastPlacements[placement.BoxNumber] = ClonePlacement(placement);
         _lastPlan = new StackPlanResult { Placements = placements, PlanningResult = success && placements.Length == all.Length };
+        _hasGeneratedPlan = true;
         return ClonePlan(_lastPlan);
     }
 
@@ -347,36 +426,46 @@ public sealed class StackPlanner
             return CreateCapacityResult(queryBox, false, 0, false, "当前箱子规划未完成，无法查询剩余容量。");
         }
 
-        double palletArea = (PalletXMaxMm - PalletXMinMm) * (PalletYMaxMm - PalletYMinMm);
-        int layerUpperBound = (int)Math.Ceiling(StackMaxHeightMm / heightMm);
-        int areaUpperBound = (int)Math.Ceiling(palletArea / (lengthMm * widthMm));
-        int queryCount = Math.Max(1, areaUpperBound * layerUpperBound);
         var occupied = baselinePlan.Placements
             .Select(placement => ToPlacedBox(
                 baseline.FindBox(placement.BoxNumber)!, placement, real: false))
             .ToList();
-        int additional = 0;
-        for (int index = 0; index < queryCount; index++)
-        {
-            var placement = baseline.GenerateCandidates(queryBox, occupied)
-                .FirstOrDefault()?.Placement;
-            if (placement is null)
-                break;
-
-            var placed = ToPlacedBox(queryBox, placement, real: false);
-            if (!Fits(placed, occupied))
-                break;
-            occupied.Add(placed);
-            additional++;
-        }
+        double palletArea = (_palletXMaxMm - _palletXMinMm) * (_palletYMaxMm - _palletYMinMm);
+        int layerUpperBound = (int)Math.Ceiling(StackMaxHeightMm / heightMm);
+        int areaUpperBound = (int)Math.Ceiling(palletArea / (lengthMm * widthMm));
+        int queryCount = Math.Max(1, areaUpperBound * layerUpperBound);
+        var queryBoxes = Enumerable.Range(0, queryCount)
+            .Select(index => queryBox with
+            {
+                BoxNumber = $"__capacity_query_{index:D6}",
+                Order = index,
+            })
+            .ToArray();
+        var initial = new SearchState(
+            queryBoxes,
+            occupied,
+            new Dictionary<string, BoxPlacement>(StringComparer.Ordinal),
+            -1,
+            null);
+        var layerPlan = baseline.TryPackBestSingleLayer(initial);
+        int maxBoxesPerLayer = layerPlan?.Placements.Count ?? 0;
+        int currentLayer = layerPlan?.Placements.Values
+            .Select(x => x.LayerIndex)
+            .DefaultIfEmpty(int.MaxValue)
+            .Min() ?? int.MaxValue;
+        int remainingLayers = currentLayer == int.MaxValue
+            ? 0
+            : Math.Max(0, layerUpperBound - currentLayer);
+        int additional = maxBoxesPerLayer * remainingLayers;
 
         return CreateCapacityResult(queryBox, true, additional, true,
-            additional == 0 ? "当前状态下无法再完整放置该尺寸箱子。" : "查询完成。");
+            additional == 0 ? "当前状态下无法再完整放置该尺寸箱子。" : "查询完成。",
+            maxBoxesPerLayer, remainingLayers, maxBoxesPerLayer);
     }
 
     private StackPlanner CreatePlanningCopy()
     {
-        var copy = new StackPlanner();
+        var copy = new StackPlanner(_palletXMinMm, _palletXMaxMm, _palletYMinMm, _palletYMaxMm);
         copy.AddBoxes(_group.MutableBoxes.Select(x => CloneBox(x) with { Status = BoxStatus.OnShelf }));
         var generated = copy.GeneratePlan();
 
@@ -399,11 +488,11 @@ public sealed class StackPlanner
         return copy;
     }
 
-    private static bool CanFitSingleBox(Box box)
+    private bool CanFitSingleBox(Box box)
     {
         return new[] { (box.WidthMm, box.LengthMm), (box.LengthMm, box.WidthMm) }
-            .Any(size => size.Item1 <= PalletXMaxMm - PalletXMinMm
-                && size.Item2 <= PalletYMaxMm - PalletYMinMm)
+            .Any(size => size.Item1 <= _palletXMaxMm - _palletXMinMm
+                && size.Item2 <= _palletYMaxMm - _palletYMinMm)
             && box.HeightMm <= StackMaxHeightMm;
     }
 
@@ -412,13 +501,19 @@ public sealed class StackPlanner
         bool currentPlanValid,
         int additional,
         bool succeeded,
-        string message) => new()
+        string message,
+        int maxBoxesPerLayer = 0,
+        int remainingLayers = 0,
+        int currentLayerRemainingCount = 0) => new()
         {
             LengthMm = box.LengthMm,
             WidthMm = box.WidthMm,
             HeightMm = box.HeightMm,
             CurrentPlanValid = currentPlanValid,
             MaxAdditionalCount = additional,
+            MaxBoxesPerLayer = maxBoxesPerLayer,
+            RemainingLayers = remainingLayers,
+            CurrentLayerRemainingCount = currentLayerRemainingCount,
             QuerySucceeded = succeeded,
             Message = message,
         };
@@ -495,8 +590,8 @@ public sealed class StackPlanner
             // 0° 使用箱子的原始长宽，90° 交换 X/Y 方向尺寸。
             double width = orientation == 0 ? box.WidthMm : box.LengthMm;
             double length = orientation == 0 ? box.LengthMm : box.WidthMm;
-            var xValues = new SortedSet<double> { PalletXMinMm + EdgeMarginMm + width / 2 };
-            var yValues = new SortedSet<double> { PalletYMinMm + EdgeMarginMm + length / 2 };
+            var xValues = new SortedSet<double> { _palletXMinMm + EdgeMarginMm + width / 2 };
+            var yValues = new SortedSet<double> { _palletYMinMm + EdgeMarginMm + length / 2 };
             foreach (var item in occupied)
             {
                 xValues.Add(item.Left - StackBoxGapMm - width / 2);
@@ -607,12 +702,12 @@ public sealed class StackPlanner
     }
 
     /// <summary>检查放置项是否在托盘边界内，并且没有与已有占用发生碰撞。</summary>
-    private static bool Fits(PlacedBox item, IReadOnlyList<PlacedBox> occupied) => InsidePallet(item) && !Collides(item, occupied);
-    private static bool InsidePallet(Candidate x) => x.X - x.Width / 2 >= PalletXMinMm - Epsilon && x.X + x.Width / 2 <= PalletXMaxMm + Epsilon
-        && x.Y - x.Length / 2 >= PalletYMinMm - Epsilon && x.Y + x.Length / 2 <= PalletYMaxMm + Epsilon
+    private bool Fits(PlacedBox item, IReadOnlyList<PlacedBox> occupied) => InsidePallet(item) && !Collides(item, occupied);
+    private bool InsidePallet(Candidate x) => x.X - x.Width / 2 >= _palletXMinMm - Epsilon && x.X + x.Width / 2 <= _palletXMaxMm + Epsilon
+        && x.Y - x.Length / 2 >= _palletYMinMm - Epsilon && x.Y + x.Length / 2 <= _palletYMaxMm + Epsilon
         && x.BaseZ >= -Epsilon && x.BaseZ + x.Height <= StackMaxHeightMm + Epsilon;
-    private static bool InsidePallet(PlacedBox x) => x.Left >= PalletXMinMm - Epsilon && x.Right <= PalletXMaxMm + Epsilon
-        && x.Bottom >= PalletYMinMm - Epsilon && x.Top <= PalletYMaxMm + Epsilon && x.BaseZ >= -Epsilon
+    private bool InsidePallet(PlacedBox x) => x.Left >= _palletXMinMm - Epsilon && x.Right <= _palletXMaxMm + Epsilon
+        && x.Bottom >= _palletYMinMm - Epsilon && x.Top <= _palletYMaxMm + Epsilon && x.BaseZ >= -Epsilon
         && x.TopZ <= StackMaxHeightMm + Epsilon;
     // 候选箱的二维投影按间隙膨胀；只有 Z 方向存在重叠时才算三维碰撞。
     private static bool Collides(Candidate c, IReadOnlyList<PlacedBox> occupied) => occupied.Any(x =>
@@ -651,7 +746,12 @@ public sealed class StackPlanner
         // 同一规划调用内，同箱型优先复用一层相对布局；模板只作为快路径，
         // 不能替代后续的边界、碰撞和支撑校验。
         var layerTemplates = new Dictionary<string, LayerTemplate>(StringComparer.Ordinal);
-        var frontier = new[] { initial };
+        // 先构造一个“当前层最大装箱”种子。该种子按当前层保留多个布局分支，
+        // 避免逐箱搜索先占据关键位置后产生不可利用的碎片。
+        var layerSeed = TryPackBestSingleLayer(initial);
+        var frontier = layerSeed is null
+            ? new[] { initial }
+            : new[] { initial, layerSeed };
         SearchState best = initial;
         for (int depth = 0; depth < boxes.Count && frontier.Length > 0; depth++)
         {
@@ -733,6 +833,85 @@ public sealed class StackPlanner
             .ThenBy(SearchBoundingArea)
             .ThenBy(SearchSignature, StringComparer.Ordinal)
             .First();
+    }
+
+    /// <summary>
+    /// 在当前最低可用层执行一次有限宽度单层装箱，返回该层放置数量最多的布局。
+    /// 该方法只生成搜索种子，后续仍由主搜索验证多层组合和其他箱型。
+    /// </summary>
+    private SearchState? TryPackBestSingleLayer(SearchState initial)
+    {
+        if (initial.Remaining.Count == 0)
+            return null;
+
+        int targetLayer = initial.Remaining
+            .SelectMany(box => GenerateCandidates(box, initial.Occupied))
+            .Select(candidate => candidate.Placement.LayerIndex)
+            .DefaultIfEmpty(int.MaxValue)
+            .Min();
+        if (targetLayer == int.MaxValue)
+            return null;
+
+        var frontier = new[] { initial };
+        SearchState best = initial;
+        for (int depth = 0; depth < initial.Remaining.Count && frontier.Length > 0; depth++)
+        {
+            var next = new List<SearchState>();
+            foreach (var state in frontier)
+            {
+                bool expanded = false;
+                foreach (var box in state.Remaining
+                             .OrderByDescending(BoxBaseArea)
+                             .ThenByDescending(BoxVolume)
+                             .ThenBy(x => x.Order)
+                             .ThenBy(x => x.BoxNumber, StringComparer.Ordinal))
+                {
+                    foreach (var candidate in GenerateCandidates(box, state.Occupied)
+                                 .Where(x => x.Placement.LayerIndex == targetLayer))
+                    {
+                        var placed = ToPlacedBox(box, candidate.Placement, false);
+                        if (!Fits(placed, state.Occupied)) continue;
+
+                        var placements = new Dictionary<string, BoxPlacement>(
+                            state.Placements, StringComparer.Ordinal)
+                        {
+                            [box.BoxNumber] = candidate.Placement,
+                        };
+                        var remaining = state.Remaining
+                            .Where(x => !ReferenceEquals(x, box)).ToArray();
+                        next.Add(new SearchState(
+                            remaining,
+                            state.Occupied.Concat(new[] { placed }).ToArray(),
+                            placements,
+                            targetLayer,
+                            BoxTypeKey(box)));
+                        expanded = true;
+                    }
+                }
+
+                // 保留当前层无法继续扩展的终止状态，供评分选择。
+                if (!expanded)
+                    next.Add(state);
+            }
+
+            frontier = next
+                .OrderByDescending(SearchPlacedCount)
+                .ThenByDescending(SearchUpperBound)
+                .ThenBy(SearchBoundingArea)
+                .ThenBy(SearchSignature, StringComparer.Ordinal)
+                .Take(BeamWidth)
+                .ToArray();
+
+            var roundBest = frontier
+                .OrderByDescending(SearchPlacedCount)
+                .ThenBy(SearchBoundingArea)
+                .ThenBy(SearchSignature, StringComparer.Ordinal)
+                .FirstOrDefault();
+            if (roundBest is not null && IsBetterSearchState(roundBest, best))
+                best = roundBest;
+        }
+
+        return SearchPlacedCount(best) > SearchPlacedCount(initial) ? best : null;
     }
 
     /// <summary>
@@ -860,7 +1039,7 @@ public sealed class StackPlanner
     /// 为四个 400×600 箱子生成同一支撑高度的风车布局。
     /// 支撑层可以是托盘底面，也可以是已经铺平的上一层。
     /// </summary>
-    private static Dictionary<string, BoxPlacement> TryBuildWindmillLayer(
+    private Dictionary<string, BoxPlacement> TryBuildWindmillLayer(
         IReadOnlyList<Box> boxes,
         List<PlacedBox> occupied)
     {
@@ -872,8 +1051,8 @@ public sealed class StackPlanner
         if (large.Any(x => !IsWindmillBox(x)))
             return result;
 
-        double xMin = PalletXMinMm;
-        double yMin = PalletYMinMm;
+        double xMin = _palletXMinMm;
+        double yMin = _palletYMinMm;
         var candidates = new[]
         {
             (X: xMin + 200, Y: yMin + 300, Angle: 90),

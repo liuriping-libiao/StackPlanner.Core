@@ -106,6 +106,12 @@ public sealed class RemainingCapacityResult
     public required bool CurrentPlanValid { get; init; }
     /// <summary>当前状态下最多还能完整放置的同尺寸箱子数量。</summary>
     public required int MaxAdditionalCount { get; init; }
+    /// <summary>当前可用支撑层最多可放置的箱子数量。</summary>
+    public int MaxBoxesPerLayer { get; init; }
+    /// <summary>当前可用支撑层及其后仍可使用的层数。</summary>
+    public int RemainingLayers { get; init; }
+    /// <summary>当前可用支撑层还剩余的可放置位置数量。</summary>
+    public int CurrentLayerRemainingCount { get; init; }
     /// <summary>查询是否完成；输入尺寸非法或当前基础规划不可用时为 false。</summary>
     public required bool QuerySucceeded { get; init; }
     /// <summary>查询结果说明。</summary>
