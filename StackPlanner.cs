@@ -313,6 +313,116 @@ public sealed class StackPlanner
         return ClonePlan(_lastPlan);
     }
 
+    /// <summary>
+    /// 查询当前状态下最多还能完整放置多少个指定尺寸的箱子。
+    /// 查询使用规划器副本，不会修改当前箱子集合、状态或最近一次规划结果。
+    /// </summary>
+    /// <param name="lengthMm">查询箱子的长度，单位为 mm。</param>
+    /// <param name="widthMm">查询箱子的宽度，单位为 mm。</param>
+    /// <param name="heightMm">查询箱子的高度，单位为 mm。</param>
+    public RemainingCapacityResult GetMaxAdditionalBoxCount(
+        double lengthMm,
+        double widthMm,
+        double heightMm)
+    {
+        var queryBox = new Box
+        {
+            BoxNumber = "__capacity_query__",
+            LengthMm = lengthMm,
+            WidthMm = widthMm,
+            HeightMm = heightMm,
+        };
+        ValidateBox(queryBox);
+
+        if (!CanFitSingleBox(queryBox))
+        {
+            return CreateCapacityResult(queryBox, false, 0, false, "查询箱子尺寸超出托盘可放置范围。");
+        }
+
+        var baseline = CreatePlanningCopy();
+        var baselinePlan = baseline.GeneratePlan();
+        int currentCount = _group.MutableBoxes.Count;
+        if (!baselinePlan.PlanningResult || baselinePlan.Placements.Count != currentCount)
+        {
+            return CreateCapacityResult(queryBox, false, 0, false, "当前箱子规划未完成，无法查询剩余容量。");
+        }
+
+        double palletArea = (PalletXMaxMm - PalletXMinMm) * (PalletYMaxMm - PalletYMinMm);
+        int layerUpperBound = (int)Math.Ceiling(StackMaxHeightMm / heightMm);
+        int areaUpperBound = (int)Math.Ceiling(palletArea / (lengthMm * widthMm));
+        int queryCount = Math.Max(1, areaUpperBound * layerUpperBound);
+        var occupied = baselinePlan.Placements
+            .Select(placement => ToPlacedBox(
+                baseline.FindBox(placement.BoxNumber)!, placement, real: false))
+            .ToList();
+        int additional = 0;
+        for (int index = 0; index < queryCount; index++)
+        {
+            var placement = baseline.GenerateCandidates(queryBox, occupied)
+                .FirstOrDefault()?.Placement;
+            if (placement is null)
+                break;
+
+            var placed = ToPlacedBox(queryBox, placement, real: false);
+            if (!Fits(placed, occupied))
+                break;
+            occupied.Add(placed);
+            additional++;
+        }
+
+        return CreateCapacityResult(queryBox, true, additional, true,
+            additional == 0 ? "当前状态下无法再完整放置该尺寸箱子。" : "查询完成。");
+    }
+
+    private StackPlanner CreatePlanningCopy()
+    {
+        var copy = new StackPlanner();
+        copy.AddBoxes(_group.MutableBoxes.Select(x => CloneBox(x) with { Status = BoxStatus.OnShelf }));
+        var generated = copy.GeneratePlan();
+
+        foreach (var box in _group.MutableBoxes.Where(x => x.Status != BoxStatus.OnShelf))
+        {
+            BoxPlacement? placement = null;
+            if (_succeeded.TryGetValue(box.BoxNumber, out var fixedPlacement))
+                placement = fixedPlacement.Placement;
+            else if (_lastPlacements.TryGetValue(box.BoxNumber, out var lastPlacement))
+                placement = lastPlacement;
+            else
+                placement = generated.Placements.FirstOrDefault(x => x.BoxNumber == box.BoxNumber);
+
+            if (placement is null)
+                throw new InvalidOperationException($"箱子 {box.BoxNumber} 没有可恢复的规划位置。");
+
+            copy.UpdateBoxStatus(box.BoxNumber, box.Status, placement);
+        }
+
+        return copy;
+    }
+
+    private static bool CanFitSingleBox(Box box)
+    {
+        return new[] { (box.WidthMm, box.LengthMm), (box.LengthMm, box.WidthMm) }
+            .Any(size => size.Item1 <= PalletXMaxMm - PalletXMinMm
+                && size.Item2 <= PalletYMaxMm - PalletYMinMm)
+            && box.HeightMm <= StackMaxHeightMm;
+    }
+
+    private static RemainingCapacityResult CreateCapacityResult(
+        Box box,
+        bool currentPlanValid,
+        int additional,
+        bool succeeded,
+        string message) => new()
+        {
+            LengthMm = box.LengthMm,
+            WidthMm = box.WidthMm,
+            HeightMm = box.HeightMm,
+            CurrentPlanValid = currentPlanValid,
+            MaxAdditionalCount = additional,
+            QuerySucceeded = succeeded,
+            Message = message,
+        };
+
     private bool TryBuildWindmillGroups(
         IReadOnlyList<Box> boxes,
         List<PlacedBox> occupied,

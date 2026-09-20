@@ -90,3 +90,24 @@ public sealed class StackPlanResult
     /// <summary>所有箱子都成功获得合法位置时为 true，否则为 false。</summary>
     public required bool PlanningResult { get; init; }
 }
+
+/// <summary>
+/// 指定尺寸箱子的剩余容量查询结果。
+/// </summary>
+public sealed class RemainingCapacityResult
+{
+    /// <summary>查询箱子的长度，单位为 mm。</summary>
+    public required double LengthMm { get; init; }
+    /// <summary>查询箱子的宽度，单位为 mm。</summary>
+    public required double WidthMm { get; init; }
+    /// <summary>查询箱子的高度，单位为 mm。</summary>
+    public required double HeightMm { get; init; }
+    /// <summary>当前箱子全部具备合法规划位置时为 true。</summary>
+    public required bool CurrentPlanValid { get; init; }
+    /// <summary>当前状态下最多还能完整放置的同尺寸箱子数量。</summary>
+    public required int MaxAdditionalCount { get; init; }
+    /// <summary>查询是否完成；输入尺寸非法或当前基础规划不可用时为 false。</summary>
+    public required bool QuerySucceeded { get; init; }
+    /// <summary>查询结果说明。</summary>
+    public required string Message { get; init; }
+}
