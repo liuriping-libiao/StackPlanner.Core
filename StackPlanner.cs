@@ -234,30 +234,49 @@ public sealed class StackPlanner
             .ThenBy(x => x.Order)
             .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
             .ToArray();
-        var windmillBoxes = onShelf.Where(IsWindmillBox).Take(4).ToArray();
+        var windmillBoxes = onShelf.Where(IsWindmillBox).ToArray();
         SearchState searched;
-        if (windmillBoxes.Length == 4)
+        if (windmillBoxes.Length >= 4 && windmillBoxes.Length % 4 == 0)
         {
-            var otherBoxes = onShelf.Where(x => !windmillBoxes.Contains(x)).ToArray();
-            if (occupied.Count == 0)
+            var otherBoxes = onShelf.Where(x => !IsWindmillBox(x)).ToArray();
+            var windmillTypeKey = BoxTypeKey(windmillBoxes[0]);
+            var currentTypeKey = GetOccupiedTypeKey(occupied, occupied.Count == 0
+                ? -1
+                : occupied.Max(x => x.Placement.LayerIndex));
+            bool windmillFirst = otherBoxes.Length == 0
+                || occupied.Count == 0
+                || string.Equals(currentTypeKey, windmillTypeKey, StringComparison.Ordinal);
+
+            if (windmillFirst)
             {
-                // 空托盘时保留原规则：先用风车占据底层，再把普通箱子放到其上方。
-                var windmill = TryBuildWindmillLayer(windmillBoxes, occupied);
-                searched = windmill.Count == 4
-                    ? SearchOnShelf(otherBoxes, occupied, windmill)
-                    : SearchOnShelf(onShelf, occupied);
+                var windmillOccupied = occupied.ToList();
+                var windmillPlacements = new Dictionary<string, BoxPlacement>(StringComparer.Ordinal);
+                bool windmillSucceeded = TryBuildWindmillGroups(windmillBoxes, windmillOccupied, windmillPlacements);
+                if (windmillSucceeded)
+                {
+                    var otherSearch = SearchOnShelf(otherBoxes, windmillOccupied);
+                    var combinedPlacements = new Dictionary<string, BoxPlacement>(
+                        otherSearch.Placements, StringComparer.Ordinal);
+                    foreach (var placement in windmillPlacements.Values)
+                        combinedPlacements[placement.BoxNumber] = placement;
+                    searched = otherSearch with { Placements = combinedPlacements };
+                }
+                else
+                {
+                    searched = SearchOnShelf(onShelf, occupied);
+                }
             }
             else
             {
-                // 已有箱子时先把当前低层铺平，再在该平面上尝试风车布局。
-                var otherSearch = SearchOnShelf(otherBoxes, occupied);
+                // 当前层已有其他箱型时，先连续完成该箱型，再把风车箱放到后续层。
+                var otherSearch = SearchOnShelf(otherBoxes, occupied.ToList());
                 var combinedOccupied = otherSearch.Occupied.ToList();
-                var windmill = TryBuildWindmillLayer(windmillBoxes, combinedOccupied);
-                if (windmill.Count == 4)
+                var windmillPlacements = new Dictionary<string, BoxPlacement>(StringComparer.Ordinal);
+                if (TryBuildWindmillGroups(windmillBoxes, combinedOccupied, windmillPlacements))
                 {
                     var combinedPlacements = new Dictionary<string, BoxPlacement>(
                         otherSearch.Placements, StringComparer.Ordinal);
-                    foreach (var placement in windmill.Values)
+                    foreach (var placement in windmillPlacements.Values)
                         combinedPlacements[placement.BoxNumber] = placement;
                     searched = otherSearch with
                     {
@@ -292,6 +311,30 @@ public sealed class StackPlanner
         foreach (var placement in placements) _lastPlacements[placement.BoxNumber] = ClonePlacement(placement);
         _lastPlan = new StackPlanResult { Placements = placements, PlanningResult = success && placements.Length == all.Length };
         return ClonePlan(_lastPlan);
+    }
+
+    private bool TryBuildWindmillGroups(
+        IReadOnlyList<Box> boxes,
+        List<PlacedBox> occupied,
+        IDictionary<string, BoxPlacement> placements)
+    {
+        if (boxes.Count < 4 || boxes.Count % 4 != 0)
+            return false;
+
+        int initialCount = occupied.Count;
+        foreach (var group in boxes.Chunk(4))
+        {
+            var layer = TryBuildWindmillLayer(group, occupied);
+            if (layer.Count != 4)
+            {
+                occupied.RemoveRange(initialCount, occupied.Count - initialCount);
+                placements.Clear();
+                return false;
+            }
+            foreach (var placement in layer.Values)
+                placements[placement.BoxNumber] = placement;
+        }
+        return true;
     }
 
     private void AssignOrders()
@@ -400,8 +443,8 @@ public sealed class StackPlanner
 
     private static List<PlacedBox> Supporting(Candidate c, IReadOnlyList<PlacedBox> occupied)
     {
-        // 只有 CanSupport=true 的箱顶才可作为实际支撑面。
-        // 非 OnShelf 箱子的规划占用只用于避让，因此不会提供支撑。
+        // 只有 CanSupport=true 的箱顶才可作为规划支撑面。
+        // 非 OnShelf 箱子虽然不一定是真实成功占用，但其规划占用可以提供支撑。
         return occupied.Where(x => x.TopZ <= c.BaseZ + Epsilon && Math.Abs(x.TopZ - c.BaseZ) <= Epsilon
                 && x.CanSupport
                 && OverlapLength(c.X - c.Width / 2, c.X + c.Width / 2, x.Left, x.Right) > Epsilon
@@ -503,6 +546,13 @@ public sealed class StackPlanner
             foreach (var state in frontier)
             {
                 var choice = SelectNextBox(state);
+                if (choice is null)
+                {
+                    // 当前分支的剩余箱子都没有合法候选位置，
+                    // 将其作为终止分支保留，不能让一个死分支中断整个搜索。
+                    next.Add(state);
+                    continue;
+                }
                 var box = choice.Box;
                 var remaining = state.Remaining.Where(x => !ReferenceEquals(x, box)).ToArray();
                 var candidates = choice.Candidates;
@@ -689,7 +739,7 @@ public sealed class StackPlanner
     /// 选择当前层的下一个箱子。只有当前最低可用层没有任何剩余箱子可放时，
     /// 才允许搜索进入更高层；当前层优先继续放置同一箱型。
     /// </summary>
-    private BoxChoice SelectNextBox(SearchState state)
+    private BoxChoice? SelectNextBox(SearchState state)
     {
         var candidatesByBox = state.Remaining
             .Select(box => new SearchBoxCandidates(box, GenerateCandidates(box, state.Occupied)))
@@ -706,9 +756,11 @@ public sealed class StackPlanner
             .Where(x => x.Candidates.Count > 0)
             .ToArray();
         if (currentLayerBoxes.Length == 0)
-            throw new InvalidOperationException("搜索状态没有可用候选箱子。");
+            return null;
 
-        string? typeKey = state.PreferredLayer == currentLayer ? state.PreferredTypeKey : null;
+        string? typeKey = state.PreferredLayer == currentLayer
+            ? state.PreferredTypeKey
+            : GetOccupiedTypeKey(state.Occupied, currentLayer);
         var preferredTypeBoxes = string.IsNullOrEmpty(typeKey)
             ? Array.Empty<SearchBoxCandidates>()
             : currentLayerBoxes.Where(x => BoxTypeKey(x.Box) == typeKey).ToArray();
@@ -730,6 +782,23 @@ public sealed class StackPlanner
             .First();
 
         return new BoxChoice(selected.Box, selected.Candidates);
+    }
+
+    private string? GetOccupiedTypeKey(IReadOnlyList<PlacedBox> occupied, int layer)
+    {
+        if (layer < 0)
+            return null;
+
+        return occupied
+            .Where(x => x.Placement.LayerIndex == layer)
+            .Select(x => FindBox(x.Placement.BoxNumber))
+            .Where(x => x is not null)
+            .Select(x => BoxTypeKey(x!))
+            .GroupBy(x => x, StringComparer.Ordinal)
+            .OrderByDescending(x => x.Count())
+            .ThenBy(x => x.Key, StringComparer.Ordinal)
+            .Select(x => x.Key)
+            .FirstOrDefault();
     }
 
     private static string BoxTypeKey(Box box)
@@ -784,8 +853,11 @@ public sealed class StackPlanner
         double width = rotated ? box.LengthMm : box.WidthMm;
         double length = rotated ? box.WidthMm : box.LengthMm;
         double baseZ = PlaceFloorZMm - placement.Zmm - box.HeightMm;
+        // 规划阶段已经写入 occupied 的箱子都可以作为后续候选的支撑面，
+        // 包括仍处于 OnShelf 状态但已经被本次方案放置的箱子。
+        // real 仅表示是否为真实成功占用，不限制规划支撑能力。
         return new PlacedBox(placement.Xmm, placement.Ymm, baseZ, width, length, box.HeightMm, placement,
-            real, real || box.Status == BoxStatus.OnShelf);
+            real, true);
     }
 
     /// <summary>按唯一箱号查找内部箱子对象。</summary>
