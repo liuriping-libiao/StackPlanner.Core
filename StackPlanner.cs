@@ -28,6 +28,8 @@ public sealed class StackPlanner
     private const int BeamWidth = 96;
     /// <summary>单个箱子最多保留的候选位置数量。</summary>
     private const int MaxCandidatesPerBox = 64;
+    /// <summary>中间完整层允许提交的最低底面积利用率。</summary>
+    private const double MinimumCompleteLayerUtilization = 0.75;
     private double _palletXMinMm;
     private double _palletXMaxMm;
     private double _palletYMinMm;
@@ -303,8 +305,8 @@ public sealed class StackPlanner
             output[box.BoxNumber] = placement;
         }
 
-        // OnShelf 箱子允许重排：保留多个布局分支，优先大箱子和难放箱子，
-        // 在可堆箱数相同的情况下再比较高度和紧凑性。
+        // OnShelf 箱子允许重排：先逐层寻找高利用率的混合箱型完整层，
+        // 无法形成完整层的剩余箱子统一放到最后的最高层。
         // 四个风车箱需要作为整体放置；先规划其他箱子铺平支撑层，再尝试风车布局。
         // 若风车布局不适用，则回退到普通有限宽度搜索。
         var onShelf = all.Where(x => x.Status == BoxStatus.OnShelf)
@@ -447,7 +449,7 @@ public sealed class StackPlanner
             new Dictionary<string, BoxPlacement>(StringComparer.Ordinal),
             -1,
             null);
-        var layerPlan = baseline.TryPackBestSingleLayer(initial);
+        var layerPlan = baseline.TryPackBestSingleLayer(initial, startAboveHighest: false);
         int maxBoxesPerLayer = layerPlan?.Placements.Count ?? 0;
         int currentLayer = layerPlan?.Placements.Values
             .Select(x => x.LayerIndex)
@@ -723,8 +725,8 @@ public sealed class StackPlanner
     private static double Round(double value) => Math.Round(value, 3, MidpointRounding.AwayFromZero);
 
     /// <summary>
-    /// 对仍在货架上的箱子执行确定性的有限宽度搜索。
-    /// 搜索允许跳过当前箱子，从而在空间不足时尽量放置更多其他箱子。
+    /// 对仍在货架上的箱子执行确定性的分层搜索。
+    /// 中间层只提交达到最低利用率的混合布局；剩余箱子统一作为最高层处理。
     /// </summary>
     private SearchState SearchOnShelf(IReadOnlyList<Box> boxes, IReadOnlyList<PlacedBox> initialOccupied)
         => SearchOnShelf(boxes, initialOccupied,
@@ -743,124 +745,171 @@ public sealed class StackPlanner
             null);
         if (boxes.Count == 0) return initial;
 
-        // 同一规划调用内，同箱型优先复用一层相对布局；模板只作为快路径，
-        // 不能替代后续的边界、碰撞和支撑校验。
-        var layerTemplates = new Dictionary<string, LayerTemplate>(StringComparer.Ordinal);
-        // 先构造一个“当前层最大装箱”种子。该种子按当前层保留多个布局分支，
-        // 避免逐箱搜索先占据关键位置后产生不可利用的碎片。
-        var layerSeed = TryPackBestSingleLayer(initial);
-        var frontier = layerSeed is null
-            ? new[] { initial }
-            : new[] { initial, layerSeed };
-        SearchState best = initial;
-        for (int depth = 0; depth < boxes.Count && frontier.Length > 0; depth++)
+        var current = initial;
+        while (current.Remaining.Count > 0)
         {
-            var next = new List<SearchState>();
-            foreach (var state in frontier)
+            var layerCandidate = FindBestSingleLayerCandidate(current);
+            if (layerCandidate is null)
+                break;
+
+            var layer = layerCandidate.State;
+            int layerIndex = layerCandidate.LayerIndex;
+            if (SearchLayerUtilization(layer, layerIndex) + Epsilon
+                < MinimumCompleteLayerUtilization)
             {
-                var choice = SelectNextBox(state);
-                if (choice is null)
+                // 从本轮开始进入最高层尾部模式：不再要求利用率阈值，
+                // 但所有后续箱子只能继续放在当前最高层之上，不能回填更低层。
+                current = layer;
+                while (current.Remaining.Count > 0)
                 {
-                    // 当前分支的剩余箱子都没有合法候选位置，
-                    // 将其作为终止分支保留，不能让一个死分支中断整个搜索。
-                    next.Add(state);
-                    continue;
+                    var nextTopLayer = FindBestSingleLayerCandidate(current)?.State;
+                    if (nextTopLayer is null)
+                        break;
+                    current = nextTopLayer;
                 }
-                var box = choice.Box;
-                var remaining = state.Remaining.Where(x => !ReferenceEquals(x, box)).ToArray();
-                var candidates = choice.Candidates;
-
-                // 保留跳过分支，避免一个放不下的大箱子阻塞其他箱子。
-                next.Add(new SearchState(remaining, state.Occupied, state.Placements,
-                    state.PreferredLayer, state.PreferredTypeKey));
-                foreach (var candidate in candidates)
-                {
-                    var placed = ToPlacedBox(box, candidate.Placement, false);
-                    if (!Fits(placed, state.Occupied)) continue;
-                    var placements = new Dictionary<string, BoxPlacement>(state.Placements, StringComparer.Ordinal)
-                    {
-                        [box.BoxNumber] = candidate.Placement,
-                    };
-                    next.Add(new SearchState(
-                        remaining,
-                        state.Occupied.Concat(new[] { placed }).ToArray(),
-                        placements,
-                        candidate.Placement.LayerIndex,
-                        BoxTypeKey(box)));
-
-                    // 模板批量分支只增加一个候选搜索状态；普通单箱分支始终保留，
-                    // 因此模板不适用时不会改变原有规划能力。
-                    string typeKey = BoxTypeKey(box);
-                    if (!layerTemplates.TryGetValue(typeKey, out var template))
-                    {
-                        template = BuildLayerTemplate(box);
-                        layerTemplates[typeKey] = template;
-                    }
-                    var bulkState = TryApplyLayerTemplate(
-                        state, box, candidate, template, remaining);
-                    if (bulkState is not null)
-                        next.Add(bulkState);
-                }
+                break;
             }
 
-            frontier = next.OrderByDescending(SearchPlacedCount)
-                .ThenByDescending(x => SearchUpperBound(x))
-                .ThenBy(SearchMaxLayer)
-                .ThenBy(SearchMaxTopZ)
-                .ThenByDescending(SearchLargeBoxLowLayerScore)
-                .ThenBy(SearchBoundingArea)
-                .ThenBy(SearchSignature, StringComparer.Ordinal)
-                .Take(BeamWidth)
-                .ToArray();
-
-            var roundBest = frontier.OrderByDescending(SearchPlacedCount)
-                .ThenBy(SearchMaxLayer)
-                .ThenBy(SearchMaxTopZ)
-                .ThenByDescending(SearchLargeBoxLowLayerScore)
-                .ThenBy(SearchBoundingArea)
-                .ThenBy(SearchSignature, StringComparer.Ordinal)
-                .FirstOrDefault();
-            if (roundBest is not null && IsBetterSearchState(roundBest, best)) best = roundBest;
-            if (frontier.Any(x => x.Remaining.Count == 0 && x.Placements.Count == boxes.Count))
-                break;
+            current = layer;
         }
 
-        return frontier.Concat(new[] { best })
-            .OrderByDescending(SearchPlacedCount)
-            .ThenBy(SearchMaxLayer)
-            .ThenBy(SearchMaxTopZ)
-            .ThenByDescending(SearchLargeBoxLowLayerScore)
-            .ThenBy(SearchBoundingArea)
-            .ThenBy(SearchSignature, StringComparer.Ordinal)
-            .First();
+        // 没有任何可放位置时结束；尾部模式已经在上面的分支中完成。
+        if (current.Remaining.Count > 0)
+        {
+            var topLayer = FindBestSingleLayerCandidate(current)?.State;
+            if (topLayer is not null)
+                current = topLayer;
+        }
+
+        return current;
     }
 
     /// <summary>
-    /// 在当前最低可用层执行一次有限宽度单层装箱，返回该层放置数量最多的布局。
-    /// 该方法只生成搜索种子，后续仍由主搜索验证多层组合和其他箱型。
+    /// 在当前最低可用层执行一次混合箱型有限宽度单层装箱。
+    /// 布局比较严格按利用率、碎片、包围区域、支撑面积和确定性签名进行。
     /// </summary>
-    private SearchState? TryPackBestSingleLayer(SearchState initial)
+    private LayerSearchCandidate? FindBestSingleLayerCandidate(SearchState initial)
     {
-        if (initial.Remaining.Count == 0)
+        var heightGroups = new List<List<Box>>();
+        foreach (var box in initial.Remaining
+                     .OrderBy(x => x.HeightMm)
+                     .ThenBy(x => x.Order)
+                     .ThenBy(x => x.BoxNumber, StringComparer.Ordinal))
+        {
+            var group = heightGroups.LastOrDefault();
+            if (group is null || Math.Abs(group[0].HeightMm - box.HeightMm) > Epsilon)
+            {
+                heightGroups.Add(new List<Box> { box });
+            }
+            else
+            {
+                group.Add(box);
+            }
+        }
+
+        LayerSearchCandidate? best = null;
+        foreach (var group in heightGroups)
+        {
+            double height = group[0].HeightMm;
+            var mixed = TryPackBestSingleLayer(initial, height);
+            AddLayerCandidate(ref best, initial, mixed, singleType: false, height);
+
+            foreach (var typeKey in group
+                         .Select(BoxTypeKey)
+                         .Distinct(StringComparer.Ordinal)
+                         .OrderBy(x => x, StringComparer.Ordinal))
+            {
+                var singleType = TryPackBestSingleLayer(initial, height, typeKey);
+                AddLayerCandidate(ref best, initial, singleType, singleType: true, height);
+            }
+        }
+
+        return best;
+    }
+
+    private void AddLayerCandidate(
+        ref LayerSearchCandidate? best,
+        SearchState initial,
+        SearchState? state,
+        bool singleType,
+        double height)
+    {
+        if (state is null)
+            return;
+
+        int layer = GetSearchLayer(state, initial);
+        if (layer == int.MaxValue)
+            return;
+
+        var candidate = new LayerSearchCandidate(state, singleType, height, layer);
+        if (best is null || IsBetterLayerCandidate(candidate, best))
+            best = candidate;
+    }
+
+    private bool IsBetterLayerCandidate(
+        LayerSearchCandidate candidate,
+        LayerSearchCandidate current)
+    {
+        double candidateUtilization = SearchLayerUtilization(candidate.State, candidate.LayerIndex);
+        double currentUtilization = SearchLayerUtilization(current.State, current.LayerIndex);
+        if (candidateUtilization > currentUtilization + Epsilon) return true;
+        if (currentUtilization > candidateUtilization + Epsilon) return false;
+
+        if (candidate.SingleType != current.SingleType)
+            return candidate.SingleType;
+
+        return IsBetterSingleLayer(candidate.State, current.State, candidate.LayerIndex);
+    }
+
+    private SearchState? TryPackBestSingleLayer(
+        SearchState initial,
+        double? requiredHeight = null,
+        string? onlyTypeKey = null,
+        bool startAboveHighest = true)
+    {
+        var eligible = initial.Remaining
+            .Where(x => (!requiredHeight.HasValue
+                || Math.Abs(x.HeightMm - requiredHeight.Value) <= Epsilon)
+                && (onlyTypeKey is null
+                    || string.Equals(BoxTypeKey(x), onlyTypeKey, StringComparison.Ordinal)))
+            .ToArray();
+        if (eligible.Length == 0)
             return null;
 
-        int targetLayer = initial.Remaining
-            .SelectMany(box => GenerateCandidates(box, initial.Occupied))
-            .Select(candidate => candidate.Placement.LayerIndex)
-            .DefaultIfEmpty(int.MaxValue)
-            .Min();
+        int highestOccupiedLayer = initial.Occupied
+            .Select(x => x.Placement.LayerIndex)
+            .DefaultIfEmpty(-1)
+            .Max();
+        int targetLayer = startAboveHighest && highestOccupiedLayer >= 0
+            ? highestOccupiedLayer + 1
+            : eligible
+                .SelectMany(box => GenerateCandidates(box, initial.Occupied))
+                .Select(candidate => candidate.Placement.LayerIndex)
+                .DefaultIfEmpty(int.MaxValue)
+                .Min();
         if (targetLayer == int.MaxValue)
             return null;
 
         var frontier = new[] { initial };
         SearchState best = initial;
-        for (int depth = 0; depth < initial.Remaining.Count && frontier.Length > 0; depth++)
+        for (int depth = 0; depth < eligible.Length && frontier.Length > 0; depth++)
         {
             var next = new List<SearchState>();
             foreach (var state in frontier)
             {
                 bool expanded = false;
+                // 几何完全相同的箱子只扩展确定性的代表箱，避免为同型箱子的交换顺序
+                // 重复搜索；提交结果时仍然按 Order 和箱号绑定到具体箱子。
                 foreach (var box in state.Remaining
+                             .Where(x => (!requiredHeight.HasValue
+                                 || Math.Abs(x.HeightMm - requiredHeight.Value) <= Epsilon)
+                                 && (onlyTypeKey is null
+                                     || string.Equals(BoxTypeKey(x), onlyTypeKey, StringComparison.Ordinal)))
+                             .GroupBy(BoxTypeKey, StringComparer.Ordinal)
+                             .Select(group => group
+                                 .OrderBy(x => x.Order)
+                                 .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
+                                 .First())
                              .OrderByDescending(BoxBaseArea)
                              .ThenByDescending(BoxVolume)
                              .ThenBy(x => x.Order)
@@ -895,23 +944,26 @@ public sealed class StackPlanner
             }
 
             frontier = next
-                .OrderByDescending(SearchPlacedCount)
-                .ThenByDescending(SearchUpperBound)
-                .ThenBy(SearchBoundingArea)
+                .OrderByDescending(x => SearchLayerUtilization(x, targetLayer))
+                .ThenBy(x => SearchLayerFragmentation(x, targetLayer))
+                .ThenBy(x => SearchLayerBoundingArea(x, targetLayer))
+                .ThenByDescending(x => SearchLayerSupportArea(x, targetLayer))
                 .ThenBy(SearchSignature, StringComparer.Ordinal)
                 .Take(BeamWidth)
                 .ToArray();
 
             var roundBest = frontier
-                .OrderByDescending(SearchPlacedCount)
-                .ThenBy(SearchBoundingArea)
+                .OrderByDescending(x => SearchLayerUtilization(x, targetLayer))
+                .ThenBy(x => SearchLayerFragmentation(x, targetLayer))
+                .ThenBy(x => SearchLayerBoundingArea(x, targetLayer))
+                .ThenByDescending(x => SearchLayerSupportArea(x, targetLayer))
                 .ThenBy(SearchSignature, StringComparer.Ordinal)
                 .FirstOrDefault();
-            if (roundBest is not null && IsBetterSearchState(roundBest, best))
+            if (roundBest is not null && IsBetterSingleLayer(roundBest, best, targetLayer))
                 best = roundBest;
         }
 
-        return SearchPlacedCount(best) > SearchPlacedCount(initial) ? best : null;
+        return best.Placements.Count > initial.Placements.Count ? best : null;
     }
 
     /// <summary>
@@ -1263,6 +1315,93 @@ public sealed class StackPlanner
         return (right - left) * (top - bottom);
     }
 
+    private int GetSearchLayer(SearchState state, SearchState previous)
+    {
+        var addedNumbers = state.Placements.Keys
+            .Where(number => !previous.Placements.ContainsKey(number))
+            .ToHashSet(StringComparer.Ordinal);
+        return state.Placements.Values
+            .Where(x => addedNumbers.Contains(x.BoxNumber))
+            .Select(x => x.LayerIndex)
+            .DefaultIfEmpty(int.MaxValue)
+            .Min();
+    }
+
+    private double SearchLayerUtilization(SearchState state, int layer)
+    {
+        if (layer == int.MaxValue)
+            return 0;
+
+        double palletArea = (_palletXMaxMm - _palletXMinMm)
+            * (_palletYMaxMm - _palletYMinMm);
+        if (palletArea <= Epsilon)
+            return 0;
+
+        double area = state.Occupied
+            .Where(x => x.Placement.LayerIndex == layer)
+            .Sum(x => x.Width * x.Length);
+        return area / palletArea;
+    }
+
+    private static double SearchLayerBoundingArea(SearchState state, int layer)
+    {
+        var boxes = state.Occupied.Where(x => x.Placement.LayerIndex == layer).ToArray();
+        if (boxes.Length == 0)
+            return 0;
+
+        return (boxes.Max(x => x.Right) - boxes.Min(x => x.Left))
+            * (boxes.Max(x => x.Top) - boxes.Min(x => x.Bottom));
+    }
+
+    private static double SearchLayerFragmentation(SearchState state, int layer)
+    {
+        var boxes = state.Occupied.Where(x => x.Placement.LayerIndex == layer).ToArray();
+        if (boxes.Length == 0)
+            return double.PositiveInfinity;
+
+        double occupiedArea = boxes.Sum(x => x.Width * x.Length);
+        return Math.Max(0, SearchLayerBoundingArea(state, layer) - occupiedArea);
+    }
+
+    private static double SearchLayerSupportArea(SearchState state, int layer)
+    {
+        double supportArea = 0;
+        foreach (var item in state.Occupied.Where(x => x.Placement.LayerIndex == layer))
+        {
+            supportArea += state.Occupied
+                .Where(x => x.TopZ <= item.BaseZ + Epsilon
+                    && Math.Abs(x.TopZ - item.BaseZ) <= Epsilon)
+                .Sum(x => OverlapLength(item.Left, item.Right, x.Left, x.Right)
+                    * OverlapLength(item.Bottom, item.Top, x.Bottom, x.Top));
+        }
+        return supportArea;
+    }
+
+    private bool IsBetterSingleLayer(SearchState candidate, SearchState current, int layer)
+    {
+        double candidateUtilization = SearchLayerUtilization(candidate, layer);
+        double currentUtilization = SearchLayerUtilization(current, layer);
+        if (candidateUtilization > currentUtilization + Epsilon) return true;
+        if (currentUtilization > candidateUtilization + Epsilon) return false;
+
+        double candidateFragmentation = SearchLayerFragmentation(candidate, layer);
+        double currentFragmentation = SearchLayerFragmentation(current, layer);
+        if (candidateFragmentation < currentFragmentation - Epsilon) return true;
+        if (currentFragmentation < candidateFragmentation - Epsilon) return false;
+
+        double candidateBounding = SearchLayerBoundingArea(candidate, layer);
+        double currentBounding = SearchLayerBoundingArea(current, layer);
+        if (candidateBounding < currentBounding - Epsilon) return true;
+        if (currentBounding < candidateBounding - Epsilon) return false;
+
+        double candidateSupport = SearchLayerSupportArea(candidate, layer);
+        double currentSupport = SearchLayerSupportArea(current, layer);
+        if (candidateSupport > currentSupport + Epsilon) return true;
+        if (currentSupport > candidateSupport + Epsilon) return false;
+
+        return string.CompareOrdinal(SearchSignature(candidate), SearchSignature(current)) < 0;
+    }
+
     private static string SearchSignature(SearchState state) => string.Join(";", state.Placements.Values
         .OrderBy(x => x.BoxNumber, StringComparer.Ordinal)
         .Select(x => string.Join("|", x.BoxNumber, x.Xmm.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
@@ -1337,6 +1476,11 @@ public sealed class StackPlanner
 
     private sealed record SearchBoxCandidates(Box Box, IReadOnlyList<CandidatePlacement> Candidates);
     private sealed record BoxChoice(Box Box, IReadOnlyList<CandidatePlacement> Candidates);
+    private sealed record LayerSearchCandidate(
+        SearchState State,
+        bool SingleType,
+        double HeightMm,
+        int LayerIndex);
     /// <summary>同箱型一层布局的相对槽位。</summary>
     private sealed record LayerTemplateSlot(double RelativeX, double RelativeY, int OrientationDeg);
     /// <summary>同箱型一层布局模板，不包含具体箱号和绝对高度。</summary>
