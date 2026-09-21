@@ -28,8 +28,6 @@ public sealed class StackPlanner
     private const int BeamWidth = 96;
     /// <summary>单个箱子最多保留的候选位置数量。</summary>
     private const int MaxCandidatesPerBox = 64;
-    /// <summary>中间完整层允许提交的最低底面积利用率。</summary>
-    private const double MinimumCompleteLayerUtilization = 0.75;
     private double _palletXMinMm;
     private double _palletXMaxMm;
     private double _palletYMinMm;
@@ -305,75 +303,13 @@ public sealed class StackPlanner
             output[box.BoxNumber] = placement;
         }
 
-        // OnShelf 箱子允许重排：先逐层寻找高利用率的混合箱型完整层，
-        // 无法形成完整层的剩余箱子统一放到最后的最高层。
-        // 四个风车箱需要作为整体放置；先规划其他箱子铺平支撑层，再尝试风车布局。
-        // 若风车布局不适用，则回退到普通有限宽度搜索。
+        // OnShelf 箱子允许重排：逐层寻找空间利用率最高的同高混合布局。
         var onShelf = all.Where(x => x.Status == BoxStatus.OnShelf)
             .OrderByDescending(BoxBaseArea)
             .ThenBy(x => x.Order)
             .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
             .ToArray();
-        var windmillBoxes = onShelf.Where(IsWindmillBox).ToArray();
-        SearchState searched;
-        if (windmillBoxes.Length >= 4 && windmillBoxes.Length % 4 == 0)
-        {
-            var otherBoxes = onShelf.Where(x => !IsWindmillBox(x)).ToArray();
-            var windmillTypeKey = BoxTypeKey(windmillBoxes[0]);
-            var currentTypeKey = GetOccupiedTypeKey(occupied, occupied.Count == 0
-                ? -1
-                : occupied.Max(x => x.Placement.LayerIndex));
-            bool windmillFirst = otherBoxes.Length == 0
-                || occupied.Count == 0
-                || string.Equals(currentTypeKey, windmillTypeKey, StringComparison.Ordinal);
-
-            if (windmillFirst)
-            {
-                var windmillOccupied = occupied.ToList();
-                var windmillPlacements = new Dictionary<string, BoxPlacement>(StringComparer.Ordinal);
-                bool windmillSucceeded = TryBuildWindmillGroups(windmillBoxes, windmillOccupied, windmillPlacements);
-                if (windmillSucceeded)
-                {
-                    var otherSearch = SearchOnShelf(otherBoxes, windmillOccupied);
-                    var combinedPlacements = new Dictionary<string, BoxPlacement>(
-                        otherSearch.Placements, StringComparer.Ordinal);
-                    foreach (var placement in windmillPlacements.Values)
-                        combinedPlacements[placement.BoxNumber] = placement;
-                    searched = otherSearch with { Placements = combinedPlacements };
-                }
-                else
-                {
-                    searched = SearchOnShelf(onShelf, occupied);
-                }
-            }
-            else
-            {
-                // 当前层已有其他箱型时，先连续完成该箱型，再把风车箱放到后续层。
-                var otherSearch = SearchOnShelf(otherBoxes, occupied.ToList());
-                var combinedOccupied = otherSearch.Occupied.ToList();
-                var windmillPlacements = new Dictionary<string, BoxPlacement>(StringComparer.Ordinal);
-                if (TryBuildWindmillGroups(windmillBoxes, combinedOccupied, windmillPlacements))
-                {
-                    var combinedPlacements = new Dictionary<string, BoxPlacement>(
-                        otherSearch.Placements, StringComparer.Ordinal);
-                    foreach (var placement in windmillPlacements.Values)
-                        combinedPlacements[placement.BoxNumber] = placement;
-                    searched = otherSearch with
-                    {
-                        Occupied = combinedOccupied,
-                        Placements = combinedPlacements,
-                    };
-                }
-                else
-                {
-                    searched = SearchOnShelf(onShelf, occupied);
-                }
-            }
-        }
-        else
-        {
-            searched = SearchOnShelf(onShelf, occupied);
-        }
+        SearchState searched = SearchOnShelf(onShelf, occupied);
         searched = NormalizeOnShelfOrders(searched, all);
         foreach (var placement in searched.Placements.Values)
         {
@@ -395,75 +331,299 @@ public sealed class StackPlanner
     }
 
     /// <summary>
-    /// 查询当前状态下最多还能完整放置多少个指定尺寸的箱子。
-    /// 查询使用规划器副本，不会修改当前箱子集合、状态或最近一次规划结果。
+    /// 仅根据候选尺寸生成逐层空间利用率规划。
+    /// 不接收库存数量；每种尺寸视为可无限供应。结果同时返回箱子数量和空间利用率。
     /// </summary>
-    /// <param name="lengthMm">查询箱子的长度，单位为 mm。</param>
-    /// <param name="widthMm">查询箱子的宽度，单位为 mm。</param>
-    /// <param name="heightMm">查询箱子的高度，单位为 mm。</param>
-    public RemainingCapacityResult GetMaxAdditionalBoxCount(
-        double lengthMm,
-        double widthMm,
-        double heightMm)
+    public UtilizationPlanResult PlanBestUtilization(IEnumerable<BoxDimension> dimensions)
     {
-        var queryBox = new Box
-        {
-            BoxNumber = "__capacity_query__",
-            LengthMm = lengthMm,
-            WidthMm = widthMm,
-            HeightMm = heightMm,
-        };
-        ValidateBox(queryBox);
+        ArgumentNullException.ThrowIfNull(dimensions);
+        var input = dimensions.ToArray();
+        if (input.Length == 0)
+            return EmptyUtilizationPlan("至少需要一个箱子尺寸。");
 
-        if (!CanFitSingleBox(queryBox))
+        foreach (var dimension in input)
         {
-            return CreateCapacityResult(queryBox, false, 0, false, "查询箱子尺寸超出托盘可放置范围。");
+            if (dimension is null || !double.IsFinite(dimension.LengthMm)
+                || !double.IsFinite(dimension.WidthMm) || !double.IsFinite(dimension.HeightMm)
+                || dimension.LengthMm <= 0 || dimension.WidthMm <= 0 || dimension.HeightMm <= 0
+                || dimension.MinimumCount < 0)
+                return EmptyUtilizationPlan("箱子尺寸必须为有限正数，最小数量不能小于 0。");
         }
 
-        var baseline = CreatePlanningCopy();
-        var baselinePlan = baseline.GeneratePlan();
-        int currentCount = _group.MutableBoxes.Count;
-        if (!baselinePlan.PlanningResult || baselinePlan.Placements.Count != currentCount)
-        {
-            return CreateCapacityResult(queryBox, false, 0, false, "当前箱子规划未完成，无法查询剩余容量。");
-        }
-
-        var occupied = baselinePlan.Placements
-            .Select(placement => ToPlacedBox(
-                baseline.FindBox(placement.BoxNumber)!, placement, real: false))
-            .ToList();
-        double palletArea = (_palletXMaxMm - _palletXMinMm) * (_palletYMaxMm - _palletYMinMm);
-        int layerUpperBound = (int)Math.Ceiling(StackMaxHeightMm / heightMm);
-        int areaUpperBound = (int)Math.Ceiling(palletArea / (lengthMm * widthMm));
-        int queryCount = Math.Max(1, areaUpperBound * layerUpperBound);
-        var queryBoxes = Enumerable.Range(0, queryCount)
-            .Select(index => queryBox with
+        var unique = input
+            .GroupBy(x => DimensionKey(x), StringComparer.Ordinal)
+            .Select(group =>
             {
-                BoxNumber = $"__capacity_query_{index:D6}",
-                Order = index,
+                var first = group.First();
+                return first with { MinimumCount = group.Max(x => x.MinimumCount) };
             })
+            .OrderBy(x => DimensionKey(x), StringComparer.Ordinal)
             .ToArray();
-        var initial = new SearchState(
-            queryBoxes,
-            occupied,
-            new Dictionary<string, BoxPlacement>(StringComparer.Ordinal),
-            -1,
-            null);
-        var layerPlan = baseline.TryPackBestSingleLayer(initial, startAboveHighest: false);
-        int maxBoxesPerLayer = layerPlan?.Placements.Count ?? 0;
-        int currentLayer = layerPlan?.Placements.Values
-            .Select(x => x.LayerIndex)
-            .DefaultIfEmpty(int.MaxValue)
-            .Min() ?? int.MaxValue;
-        int remainingLayers = currentLayer == int.MaxValue
-            ? 0
-            : Math.Max(0, layerUpperBound - currentLayer);
-        int additional = maxBoxesPerLayer * remainingLayers;
 
-        return CreateCapacityResult(queryBox, true, additional, true,
-            additional == 0 ? "当前状态下无法再完整放置该尺寸箱子。" : "查询完成。",
-            maxBoxesPerLayer, remainingLayers, maxBoxesPerLayer);
+        // 直接搜索真实二维布局，不再生成有限数量的临时箱子。
+        var candidates = unique
+            .GroupBy(x => x.HeightMm)
+            .SelectMany(group => TypeCombinations(
+                group.OrderBy(x => DimensionKey(x), StringComparer.Ordinal).ToArray(), 3))
+            .Select(FindBestDirectLayer)
+            .Where(x => x is not null)
+            .Cast<DirectLayerResult>()
+            .ToArray();
+        if (candidates.Length == 0)
+            return EmptyUtilizationPlan("没有尺寸可以形成合法布局。");
+
+        var selected = FindBestLayerStack(candidates, unique);
+        if (selected is null)
+            return EmptyUtilizationPlan("在托盘尺寸和最大堆垛高度限制下，无法满足箱型最小数量约束。", false);
+
+        var layers = new List<LayerUtilizationSummary>();
+        var selectedCounts = selected.Layers
+            .SelectMany(x => x.Placements)
+            .GroupBy(x => DimensionKey(x.Dimension), StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
+        var plannedCounts = unique
+            .Select(dimension => new BoxTypeCount
+            {
+                LengthMm = dimension.LengthMm,
+                WidthMm = dimension.WidthMm,
+                HeightMm = dimension.HeightMm,
+                Count = selectedCounts.GetValueOrDefault(DimensionKey(dimension)),
+            })
+            .OrderBy(x => DimensionKey(new BoxDimension
+            {
+                LengthMm = x.LengthMm,
+                WidthMm = x.WidthMm,
+                HeightMm = x.HeightMm,
+            }), StringComparer.Ordinal)
+            .ToArray();
+        double palletArea = (_palletXMaxMm - _palletXMinMm) * (_palletYMaxMm - _palletYMinMm);
+        for (int layerIndex = 0; layerIndex < selected.Layers.Count; layerIndex++)
+        {
+            var layer = selected.Layers[layerIndex];
+            layers.Add(new LayerUtilizationSummary
+            {
+                LayerIndex = layerIndex,
+                Utilization = layer.OccupiedArea / palletArea,
+            });
+        }
+
+        double utilization = layers.Count == 0 ? 0 : layers.Average(x => x.Utilization);
+        return new UtilizationPlanResult
+        {
+            PlannedCounts = plannedCounts,
+            Layers = layers,
+            Utilization = utilization,
+            PlanningResult = true,
+        };
     }
+
+    private DirectStackResult? FindBestLayerStack(
+        IReadOnlyList<DirectLayerResult> candidates,
+        IReadOnlyList<BoxDimension> dimensions)
+    {
+        var minimums = dimensions.Select(x => x.MinimumCount).ToArray();
+        var keys = dimensions.Select(DimensionKey).ToArray();
+        var memo = new Dictionary<string, DirectStackResult?>();
+        return SearchLayerStack(candidates, StackMaxHeightMm, minimums, keys, memo);
+    }
+
+    private DirectStackResult? SearchLayerStack(
+        IReadOnlyList<DirectLayerResult> candidates,
+        double remainingHeight,
+        IReadOnlyList<int> remainingMinimums,
+        IReadOnlyList<string> dimensionKeys,
+        IDictionary<string, DirectStackResult?> memo)
+    {
+        string key = string.Join("|",
+            Math.Round(remainingHeight, 3, MidpointRounding.AwayFromZero)
+                .ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+            string.Join(",", remainingMinimums));
+        if (memo.TryGetValue(key, out var cached)) return cached;
+
+        bool requirementsMet = remainingMinimums.All(x => x <= 0);
+        DirectStackResult? best = requirementsMet
+            ? new DirectStackResult(Array.Empty<DirectLayerResult>(), 0, 0, string.Empty)
+            : null;
+        foreach (var candidate in candidates
+                     .Where(x => x.HeightMm <= remainingHeight + Epsilon)
+                     .OrderByDescending(x => x.OccupiedArea / x.HeightMm)
+                     .ThenBy(x => x.Signature, StringComparer.Ordinal))
+        {
+            var nextMinimums = remainingMinimums.ToArray();
+            foreach (var count in candidate.Placements
+                         .GroupBy(x => DimensionKey(x.Dimension), StringComparer.Ordinal))
+            {
+                int index = Array.IndexOf(dimensionKeys.ToArray(), count.Key);
+                if (index >= 0)
+                    nextMinimums[index] = Math.Max(0, nextMinimums[index] - count.Count());
+            }
+
+            var tail = SearchLayerStack(
+                candidates,
+                remainingHeight - candidate.HeightMm,
+                nextMinimums,
+                dimensionKeys,
+                memo);
+            if (tail is null) continue;
+
+            var plans = new[] { candidate }.Concat(tail.Layers).ToArray();
+            var current = new DirectStackResult(
+                plans,
+                candidate.OccupiedArea + tail.TotalArea,
+                candidate.Placements.Count + tail.TotalCount,
+                string.Join("/", plans.Select(x => x.Signature)));
+            if (best is null || IsBetterDirectStack(current, best)) best = current;
+        }
+
+        memo[key] = best;
+        return best;
+    }
+
+    private static bool IsBetterDirectStack(DirectStackResult candidate, DirectStackResult current)
+        => candidate.TotalArea > current.TotalArea + Epsilon
+        || Math.Abs(candidate.TotalArea - current.TotalArea) <= Epsilon
+        && (candidate.TotalCount > current.TotalCount
+            || candidate.TotalCount == current.TotalCount
+            && string.CompareOrdinal(candidate.Signature, current.Signature) < 0);
+
+    private DirectLayerResult? FindBestDirectLayer(IReadOnlyList<BoxDimension> types)
+    {
+        if (types.Count == 0) return null;
+        var frontier = new[] { new DirectLayerState(Array.Empty<DirectLayerPlacement>(), 0) };
+        DirectLayerState? best = null;
+        for (int depth = 0; depth < 256 && frontier.Length > 0; depth++)
+        {
+            var next = new List<DirectLayerState>();
+            foreach (var state in frontier)
+            foreach (var candidate in GenerateDirectCandidates(types, state.Placements))
+            {
+                if (state.Placements.Any(x => DirectCollides(candidate, x))) continue;
+                next.Add(new DirectLayerState(
+                    state.Placements.Concat(new[] { candidate }).ToArray(),
+                    state.OccupiedArea + candidate.Width * candidate.Length));
+            }
+
+            frontier = next
+                .OrderBy(x => MissingDirectTypeCount(x, types))
+                .ThenByDescending(x => x.OccupiedArea)
+                .ThenByDescending(x => x.Placements.Count)
+                .ThenBy(x => DirectFragmentation(x))
+                .ThenBy(DirectSignature, StringComparer.Ordinal)
+                .Take(BeamWidth)
+                .ToArray();
+            var roundBest = frontier
+                .Where(x => MissingDirectTypeCount(x, types) == 0)
+                .OrderByDescending(x => x.OccupiedArea)
+                .ThenByDescending(x => x.Placements.Count)
+                .ThenBy(x => DirectFragmentation(x))
+                .ThenBy(DirectSignature, StringComparer.Ordinal)
+                .FirstOrDefault();
+            if (roundBest is not null && (best is null || IsBetterDirectState(roundBest, best)))
+                best = roundBest;
+        }
+
+        if (best is null || best.Placements.Count == 0) return null;
+        return new DirectLayerResult(types[0].HeightMm, best.Placements, best.OccupiedArea, DirectSignature(best));
+    }
+
+    private static int MissingDirectTypeCount(
+        DirectLayerState state,
+        IReadOnlyList<BoxDimension> types)
+        => types.Count(type => !state.Placements.Any(x =>
+            string.Equals(DimensionKey(x.Dimension), DimensionKey(type), StringComparison.Ordinal)));
+
+    private IEnumerable<DirectLayerPlacement> GenerateDirectCandidates(
+        IReadOnlyList<BoxDimension> types,
+        IReadOnlyList<DirectLayerPlacement> placed)
+    {
+        foreach (var dimension in types)
+        foreach (var orientation in dimension.LengthMm == dimension.WidthMm ? new[] { 0 } : new[] { 0, 90 })
+        {
+            double width = orientation == 0 ? dimension.WidthMm : dimension.LengthMm;
+            double length = orientation == 0 ? dimension.LengthMm : dimension.WidthMm;
+            var xs = new SortedSet<double> { _palletXMinMm + width / 2 };
+            var ys = new SortedSet<double> { _palletYMinMm + length / 2 };
+            foreach (var item in placed)
+            {
+                xs.Add(item.Left - StackBoxGapMm - width / 2);
+                xs.Add(item.Right + StackBoxGapMm + width / 2);
+                ys.Add(item.Bottom - StackBoxGapMm - length / 2);
+                ys.Add(item.Top + StackBoxGapMm + length / 2);
+            }
+
+            foreach (var x in xs)
+            foreach (var y in ys)
+            {
+                var candidate = new DirectLayerPlacement(dimension, x, y, width, length, orientation);
+                if (candidate.Left < _palletXMinMm - Epsilon || candidate.Right > _palletXMaxMm + Epsilon
+                    || candidate.Bottom < _palletYMinMm - Epsilon || candidate.Top > _palletYMaxMm + Epsilon)
+                    continue;
+                if (placed.Any(item => DirectCollides(candidate, item))) continue;
+                yield return candidate;
+            }
+        }
+    }
+
+    private static bool DirectCollides(DirectLayerPlacement a, DirectLayerPlacement b)
+        => a.Left - StackBoxGapMm / 2 < b.Right + StackBoxGapMm / 2 - Epsilon
+        && a.Right + StackBoxGapMm / 2 > b.Left - StackBoxGapMm / 2 + Epsilon
+        && a.Bottom - StackBoxGapMm / 2 < b.Top + StackBoxGapMm / 2 - Epsilon
+        && a.Top + StackBoxGapMm / 2 > b.Bottom - StackBoxGapMm / 2 + Epsilon;
+
+    private static bool IsBetterDirectState(DirectLayerState candidate, DirectLayerState current)
+        => candidate.OccupiedArea > current.OccupiedArea + Epsilon
+        || Math.Abs(candidate.OccupiedArea - current.OccupiedArea) <= Epsilon
+        && (candidate.Placements.Count > current.Placements.Count
+            || candidate.Placements.Count == current.Placements.Count
+            && string.CompareOrdinal(DirectSignature(candidate), DirectSignature(current)) < 0);
+
+    private static double DirectFragmentation(DirectLayerState state)
+    {
+        if (state.Placements.Count == 0) return 0;
+        double left = state.Placements.Min(x => x.Left);
+        double right = state.Placements.Max(x => x.Right);
+        double bottom = state.Placements.Min(x => x.Bottom);
+        double top = state.Placements.Max(x => x.Top);
+        return Math.Max(0, (right - left) * (top - bottom) - state.OccupiedArea);
+    }
+
+    private static string DirectSignature(DirectLayerState state) => string.Join(";", state.Placements
+        .OrderBy(x => DimensionKey(x.Dimension), StringComparer.Ordinal)
+        .ThenBy(x => x.Xmm).ThenBy(x => x.Ymm).ThenBy(x => x.OrientationDeg)
+        .Select(x => string.Join("|", DimensionKey(x.Dimension), x.Xmm.ToString("R"), x.Ymm.ToString("R"), x.OrientationDeg)));
+
+    private static UtilizationPlanResult EmptyUtilizationPlan(
+        string message,
+        bool planningResult = false) => new()
+    {
+        PlannedCounts = Array.Empty<BoxTypeCount>(),
+        Layers = Array.Empty<LayerUtilizationSummary>(),
+        Utilization = 0,
+        PlanningResult = planningResult,
+        Message = message,
+    };
+
+    private double CalculateLayerUtilization(int layer)
+    {
+        double palletArea = (_palletXMaxMm - _palletXMinMm) * (_palletYMaxMm - _palletYMinMm);
+        if (palletArea <= Epsilon) return 0;
+        return _lastPlan.Placements
+            .Where(x => x.LayerIndex == layer)
+            .Select(x => ToPlacedBox(FindBox(x.BoxNumber)!, x, false))
+            .Sum(x => x.Width * x.Length) / palletArea;
+    }
+
+    private static BoxDimension ToDimension(Box box) => new()
+    {
+        LengthMm = box.LengthMm,
+        WidthMm = box.WidthMm,
+        HeightMm = box.HeightMm,
+    };
+
+    private static string DimensionKey(BoxDimension dimension)
+        => string.Join("x", Math.Min(dimension.LengthMm, dimension.WidthMm).ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+            Math.Max(dimension.LengthMm, dimension.WidthMm).ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+            dimension.HeightMm.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
 
     private StackPlanner CreatePlanningCopy()
     {
@@ -488,60 +648,6 @@ public sealed class StackPlanner
         }
 
         return copy;
-    }
-
-    private bool CanFitSingleBox(Box box)
-    {
-        return new[] { (box.WidthMm, box.LengthMm), (box.LengthMm, box.WidthMm) }
-            .Any(size => size.Item1 <= _palletXMaxMm - _palletXMinMm
-                && size.Item2 <= _palletYMaxMm - _palletYMinMm)
-            && box.HeightMm <= StackMaxHeightMm;
-    }
-
-    private static RemainingCapacityResult CreateCapacityResult(
-        Box box,
-        bool currentPlanValid,
-        int additional,
-        bool succeeded,
-        string message,
-        int maxBoxesPerLayer = 0,
-        int remainingLayers = 0,
-        int currentLayerRemainingCount = 0) => new()
-        {
-            LengthMm = box.LengthMm,
-            WidthMm = box.WidthMm,
-            HeightMm = box.HeightMm,
-            CurrentPlanValid = currentPlanValid,
-            MaxAdditionalCount = additional,
-            MaxBoxesPerLayer = maxBoxesPerLayer,
-            RemainingLayers = remainingLayers,
-            CurrentLayerRemainingCount = currentLayerRemainingCount,
-            QuerySucceeded = succeeded,
-            Message = message,
-        };
-
-    private bool TryBuildWindmillGroups(
-        IReadOnlyList<Box> boxes,
-        List<PlacedBox> occupied,
-        IDictionary<string, BoxPlacement> placements)
-    {
-        if (boxes.Count < 4 || boxes.Count % 4 != 0)
-            return false;
-
-        int initialCount = occupied.Count;
-        foreach (var group in boxes.Chunk(4))
-        {
-            var layer = TryBuildWindmillLayer(group, occupied);
-            if (layer.Count != 4)
-            {
-                occupied.RemoveRange(initialCount, occupied.Count - initialCount);
-                placements.Clear();
-                return false;
-            }
-            foreach (var placement in layer.Values)
-                placements[placement.BoxNumber] = placement;
-        }
-        return true;
     }
 
     private void AssignOrders()
@@ -754,22 +860,6 @@ public sealed class StackPlanner
 
             var layer = layerCandidate.State;
             int layerIndex = layerCandidate.LayerIndex;
-            if (SearchLayerUtilization(layer, layerIndex) + Epsilon
-                < MinimumCompleteLayerUtilization)
-            {
-                // 从本轮开始进入最高层尾部模式：不再要求利用率阈值，
-                // 但所有后续箱子只能继续放在当前最高层之上，不能回填更低层。
-                current = layer;
-                while (current.Remaining.Count > 0)
-                {
-                    var nextTopLayer = FindBestSingleLayerCandidate(current)?.State;
-                    if (nextTopLayer is null)
-                        break;
-                    current = nextTopLayer;
-                }
-                break;
-            }
-
             current = layer;
         }
 
@@ -811,16 +901,16 @@ public sealed class StackPlanner
         foreach (var group in heightGroups)
         {
             double height = group[0].HeightMm;
-            var mixed = TryPackBestSingleLayer(initial, height);
-            AddLayerCandidate(ref best, initial, mixed, singleType: false, height);
-
-            foreach (var typeKey in group
-                         .Select(BoxTypeKey)
-                         .Distinct(StringComparer.Ordinal)
-                         .OrderBy(x => x, StringComparer.Ordinal))
+            var typeKeys = group
+                .Select(BoxTypeKey)
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(x => x, StringComparer.Ordinal)
+                .ToArray();
+            foreach (var combination in TypeCombinations(typeKeys, maxSize: 3))
             {
-                var singleType = TryPackBestSingleLayer(initial, height, typeKey);
-                AddLayerCandidate(ref best, initial, singleType, singleType: true, height);
+                var layer = TryPackBestSingleLayer(
+                    initial, height, combination.ToHashSet(StringComparer.Ordinal));
+                AddLayerCandidate(ref best, initial, layer, singleType: combination.Length == 1, height);
             }
         }
 
@@ -864,14 +954,13 @@ public sealed class StackPlanner
     private SearchState? TryPackBestSingleLayer(
         SearchState initial,
         double? requiredHeight = null,
-        string? onlyTypeKey = null,
+        IReadOnlySet<string>? allowedTypeKeys = null,
         bool startAboveHighest = true)
     {
         var eligible = initial.Remaining
             .Where(x => (!requiredHeight.HasValue
                 || Math.Abs(x.HeightMm - requiredHeight.Value) <= Epsilon)
-                && (onlyTypeKey is null
-                    || string.Equals(BoxTypeKey(x), onlyTypeKey, StringComparison.Ordinal)))
+                && (allowedTypeKeys is null || allowedTypeKeys.Contains(BoxTypeKey(x))))
             .ToArray();
         if (eligible.Length == 0)
             return null;
@@ -903,8 +992,7 @@ public sealed class StackPlanner
                 foreach (var box in state.Remaining
                              .Where(x => (!requiredHeight.HasValue
                                  || Math.Abs(x.HeightMm - requiredHeight.Value) <= Epsilon)
-                                 && (onlyTypeKey is null
-                                     || string.Equals(BoxTypeKey(x), onlyTypeKey, StringComparison.Ordinal)))
+                                 && (allowedTypeKeys is null || allowedTypeKeys.Contains(BoxTypeKey(x))))
                              .GroupBy(BoxTypeKey, StringComparer.Ordinal)
                              .Select(group => group
                                  .OrderBy(x => x.Order)
@@ -964,6 +1052,63 @@ public sealed class StackPlanner
         }
 
         return best.Placements.Count > initial.Placements.Count ? best : null;
+    }
+
+    private static IEnumerable<string[]> TypeCombinations(IReadOnlyList<string> keys, int maxSize)
+    {
+        int limit = Math.Min(maxSize, keys.Count);
+        for (int size = 1; size <= limit; size++)
+        {
+            foreach (var combination in BuildTypeCombinations(keys, size, 0, new List<string>()))
+                yield return combination;
+        }
+    }
+
+    private static IEnumerable<string[]> BuildTypeCombinations(
+        IReadOnlyList<string> keys, int size, int start, List<string> current)
+    {
+        if (current.Count == size)
+        {
+            yield return current.ToArray();
+            yield break;
+        }
+
+        for (int index = start; index <= keys.Count - (size - current.Count); index++)
+        {
+            current.Add(keys[index]);
+            foreach (var combination in BuildTypeCombinations(keys, size, index + 1, current))
+                yield return combination;
+            current.RemoveAt(current.Count - 1);
+        }
+    }
+
+    private static IEnumerable<BoxDimension[]> TypeCombinations(
+        IReadOnlyList<BoxDimension> dimensions, int maxSize)
+    {
+        int limit = Math.Min(maxSize, dimensions.Count);
+        for (int size = 1; size <= limit; size++)
+        {
+            foreach (var combination in BuildDimensionCombinations(dimensions, size, 0, new List<BoxDimension>()))
+                yield return combination;
+        }
+    }
+
+    private static IEnumerable<BoxDimension[]> BuildDimensionCombinations(
+        IReadOnlyList<BoxDimension> dimensions, int size, int start, List<BoxDimension> current)
+    {
+        if (current.Count == size)
+        {
+            yield return current.ToArray();
+            yield break;
+        }
+
+        for (int index = start; index <= dimensions.Count - (size - current.Count); index++)
+        {
+            current.Add(dimensions[index]);
+            foreach (var combination in BuildDimensionCombinations(dimensions, size, index + 1, current))
+                yield return combination;
+            current.RemoveAt(current.Count - 1);
+        }
     }
 
     /// <summary>
@@ -1086,101 +1231,6 @@ public sealed class StackPlanner
             anchor.Placement.LayerIndex,
             BoxTypeKey(anchorBox));
     }
-
-    /// <summary>
-    /// 为四个 400×600 箱子生成同一支撑高度的风车布局。
-    /// 支撑层可以是托盘底面，也可以是已经铺平的上一层。
-    /// </summary>
-    private Dictionary<string, BoxPlacement> TryBuildWindmillLayer(
-        IReadOnlyList<Box> boxes,
-        List<PlacedBox> occupied)
-    {
-        var result = new Dictionary<string, BoxPlacement>(StringComparer.Ordinal);
-        if (boxes.Count < 4)
-            return result;
-
-        var large = boxes.Take(4).ToArray();
-        if (large.Any(x => !IsWindmillBox(x)))
-            return result;
-
-        double xMin = _palletXMinMm;
-        double yMin = _palletYMinMm;
-        var candidates = new[]
-        {
-            (X: xMin + 200, Y: yMin + 300, Angle: 90),
-            (X: xMin + 300, Y: yMin + 820, Angle: 0),
-            (X: xMin + 720, Y: yMin + 280, Angle: 0),
-            (X: xMin + 820, Y: yMin + 800, Angle: 90),
-        };
-
-        foreach (var baseZ in CandidateHeights(occupied).OrderByDescending(x => x))
-        {
-            result.Clear();
-            int initialCount = occupied.Count;
-            int layer = baseZ <= Epsilon
-                ? 0
-                : -1;
-            bool valid = true;
-            for (int i = 0; i < large.Length; i++)
-            {
-                var candidate = candidates[i];
-                var geometry = new Candidate(
-                    candidate.X, candidate.Y, baseZ,
-                    candidate.Angle == 0 ? large[i].WidthMm : large[i].LengthMm,
-                    candidate.Angle == 0 ? large[i].LengthMm : large[i].WidthMm,
-                    large[i].HeightMm, candidate.Angle);
-                var supports = Supporting(geometry, occupied);
-                if (!InsidePallet(geometry)
-                    || Collides(geometry, occupied)
-                    || baseZ > Epsilon && (supports.Count == 0 || !HasStableSupport(geometry, supports)))
-                {
-                    valid = false;
-                    break;
-                }
-
-                int candidateLayer = baseZ <= Epsilon
-                    ? 0
-                    : supports.Max(x => x.Placement.LayerIndex) + 1;
-                layer = layer < 0 ? candidateLayer : layer;
-                if (candidateLayer != layer)
-                {
-                    valid = false;
-                    break;
-                }
-
-                var placement = new BoxPlacement
-                {
-                    Order = large[i].Order,
-                    BoxNumber = large[i].BoxNumber,
-                    Xmm = candidate.X,
-                    Ymm = candidate.Y,
-                    Zmm = PlaceFloorZMm - baseZ - large[i].HeightMm,
-                    OrientationDeg = candidate.Angle,
-                    LayerIndex = layer,
-                };
-                var placed = ToPlacedBox(large[i], placement, false);
-                if (!Fits(placed, occupied))
-                {
-                    valid = false;
-                    break;
-                }
-                occupied.Add(placed);
-                result[large[i].BoxNumber] = placement;
-            }
-
-            if (valid && result.Count == 4)
-                return result;
-
-            occupied.RemoveRange(initialCount, occupied.Count - initialCount);
-            result.Clear();
-        }
-
-        return result;
-    }
-
-    private static bool IsWindmillBox(Box box) =>
-        (Math.Abs(box.LengthMm - 400) <= Epsilon && Math.Abs(box.WidthMm - 600) <= Epsilon)
-        || (Math.Abs(box.LengthMm - 600) <= Epsilon && Math.Abs(box.WidthMm - 400) <= Epsilon);
 
     /// <summary>
     /// 将搜索结果中的 OnShelf 箱子恢复为加入时分配的顺序号，
@@ -1485,4 +1535,34 @@ public sealed class StackPlanner
     private sealed record LayerTemplateSlot(double RelativeX, double RelativeY, int OrientationDeg);
     /// <summary>同箱型一层布局模板，不包含具体箱号和绝对高度。</summary>
     private sealed record LayerTemplate(IReadOnlyList<LayerTemplateSlot> Slots);
+    /// <summary>直接二维单层搜索中的一个箱子放置结果。</summary>
+    private sealed record DirectLayerPlacement(
+        BoxDimension Dimension,
+        double Xmm,
+        double Ymm,
+        double Width,
+        double Length,
+        int OrientationDeg)
+    {
+        public double Left => Xmm - Width / 2;
+        public double Right => Xmm + Width / 2;
+        public double Bottom => Ymm - Length / 2;
+        public double Top => Ymm + Length / 2;
+    }
+    /// <summary>直接二维单层搜索状态。</summary>
+    private sealed record DirectLayerState(
+        IReadOnlyList<DirectLayerPlacement> Placements,
+        double OccupiedArea);
+    /// <summary>一个确定性的单层布局候选。</summary>
+    private sealed record DirectLayerResult(
+        double HeightMm,
+        IReadOnlyList<DirectLayerPlacement> Placements,
+        double OccupiedArea,
+        string Signature);
+    /// <summary>不同高度单层方案组合后的整垛结果。</summary>
+    private sealed record DirectStackResult(
+        IReadOnlyList<DirectLayerResult> Layers,
+        double TotalArea,
+        int TotalCount,
+        string Signature);
 }

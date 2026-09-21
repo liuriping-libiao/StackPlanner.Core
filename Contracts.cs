@@ -91,29 +91,52 @@ public sealed class StackPlanResult
     public required bool PlanningResult { get; init; }
 }
 
-/// <summary>
-/// 指定尺寸箱子的剩余容量查询结果。
-/// </summary>
-public sealed class RemainingCapacityResult
+/// <summary>仅由箱体尺寸描述的候选箱型。</summary>
+public sealed record BoxDimension
 {
-    /// <summary>查询箱子的长度，单位为 mm。</summary>
+    /// <summary>箱子长度，单位为 mm。</summary>
     public required double LengthMm { get; init; }
-    /// <summary>查询箱子的宽度，单位为 mm。</summary>
+    /// <summary>箱子宽度，单位为 mm。</summary>
     public required double WidthMm { get; init; }
-    /// <summary>查询箱子的高度，单位为 mm。</summary>
+    /// <summary>箱子高度，单位为 mm。</summary>
     public required double HeightMm { get; init; }
-    /// <summary>当前箱子全部具备合法规划位置时为 true。</summary>
-    public required bool CurrentPlanValid { get; init; }
-    /// <summary>当前状态下最多还能完整放置的同尺寸箱子数量。</summary>
-    public required int MaxAdditionalCount { get; init; }
-    /// <summary>当前可用支撑层最多可放置的箱子数量。</summary>
-    public int MaxBoxesPerLayer { get; init; }
-    /// <summary>当前可用支撑层及其后仍可使用的层数。</summary>
-    public int RemainingLayers { get; init; }
-    /// <summary>当前可用支撑层还剩余的可放置位置数量。</summary>
-    public int CurrentLayerRemainingCount { get; init; }
-    /// <summary>查询是否完成；输入尺寸非法或当前基础规划不可用时为 false。</summary>
-    public required bool QuerySucceeded { get; init; }
-    /// <summary>查询结果说明。</summary>
-    public required string Message { get; init; }
+    /// <summary>整垛规划中该箱型允许使用的最小数量。</summary>
+    public int MinimumCount { get; init; }
+}
+
+/// <summary>单层空间利用率摘要。</summary>
+public sealed class LayerUtilizationSummary
+{
+    /// <summary>层号，从 0 开始。</summary>
+    public required int LayerIndex { get; init; }
+    /// <summary>本层底面积利用率。</summary>
+    public required double Utilization { get; init; }
+}
+
+/// <summary>一种箱型在最佳方案中的实际数量。</summary>
+public sealed class BoxTypeCount
+{
+    /// <summary>箱子长度，单位为 mm。</summary>
+    public required double LengthMm { get; init; }
+    /// <summary>箱子宽度，单位为 mm。</summary>
+    public required double WidthMm { get; init; }
+    /// <summary>箱子高度，单位为 mm。</summary>
+    public required double HeightMm { get; init; }
+    /// <summary>该箱型的规划数量。</summary>
+    public required int Count { get; init; }
+}
+
+/// <summary>仅按箱体尺寸生成的空间利用率最优规划结果。</summary>
+public sealed class UtilizationPlanResult
+{
+    /// <summary>各箱型在最佳方案中的实际数量。</summary>
+    public required IReadOnlyList<BoxTypeCount> PlannedCounts { get; init; }
+    /// <summary>逐层空间利用率。</summary>
+    public required IReadOnlyList<LayerUtilizationSummary> Layers { get; init; }
+    /// <summary>整垛各层利用率的平均值。</summary>
+    public required double Utilization { get; init; }
+    /// <summary>所有箱型的最小数量约束均满足时为 true。</summary>
+    public bool PlanningResult { get; init; } = true;
+    /// <summary>规划失败时的中文原因；成功时为空字符串。</summary>
+    public string Message { get; init; } = string.Empty;
 }
