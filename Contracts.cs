@@ -39,7 +39,8 @@ public sealed record Box
     public BoxStatus Status { get; set; } = BoxStatus.OnShelf;
     /// <summary>
     /// 堆垛顺序，从 0 开始；-1 表示尚未分配。
-    /// 非 <see cref="BoxStatus.OnShelf" /> 箱子的顺序视为已锁定。
+    /// <see cref="BoxStatus.Stacking" /> 和 <see cref="BoxStatus.StackingSucceeded" />
+    /// 箱子的顺序视为已锁定；其他未锁定箱子可在同规格替换时调整。
     /// </summary>
     public int Order { get; set; } = -1;
 }

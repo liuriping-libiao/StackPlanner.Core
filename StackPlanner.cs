@@ -39,6 +39,10 @@ public sealed class StackPlanner
     private readonly Dictionary<string, FixedPlacement> _succeeded = new(StringComparer.Ordinal);
     /// <summary>最近一次完整规划，用于恢复非 OnShelf 箱子的规划占用。</summary>
     private readonly Dictionary<string, BoxPlacement> _lastPlacements = new(StringComparer.Ordinal);
+    /// <summary>已删除但等待同规格箱子补位的次数，仅供利用率规划使用。</summary>
+    private readonly Dictionary<string, int> _pendingReplacementCounts = new(StringComparer.Ordinal);
+    /// <summary>匹配删除记录、等待在利用率规划中追加到同规格末尾的新箱号。</summary>
+    private readonly Dictionary<string, HashSet<string>> _pendingReplacementBoxes = new(StringComparer.Ordinal);
     /// <summary>对外返回的最近一次规划结果。</summary>
     private StackPlanResult _lastPlan = new() { Placements = Array.Empty<BoxPlacement>(), PlanningResult = true };
 
@@ -138,7 +142,9 @@ public sealed class StackPlanner
             throw new InvalidOperationException($"箱号已存在: {box.BoxNumber}");
         if (box.Status != BoxStatus.OnShelf)
             throw new InvalidOperationException("新增箱子必须处于 OnShelf 状态。");
-        _group.MutableBoxes.Add(CloneBox(box));
+        var added = CloneBox(box);
+        RegisterReplacementBox(added);
+        _group.MutableBoxes.Add(added);
     }
 
     /// <summary>
@@ -158,7 +164,11 @@ public sealed class StackPlanner
             if (!numbers.Add(box.BoxNumber) || _group.MutableBoxes.Any(x => x.BoxNumber == box.BoxNumber))
                 throw new InvalidOperationException($"箱号已存在: {box.BoxNumber}");
         }
-        _group.MutableBoxes.AddRange(incoming);
+        foreach (var box in incoming)
+        {
+            RegisterReplacementBox(box);
+            _group.MutableBoxes.Add(box);
+        }
     }
 
     /// <summary>
@@ -173,9 +183,11 @@ public sealed class StackPlanner
         if (box is null || box.Status is BoxStatus.StackingSucceeded or BoxStatus.Stacking)
             return false;
         int removedOrder = box.Order;
+        string typeKey = BoxTypeKey(box);
         _group.MutableBoxes.Remove(box);
         foreach (var following in _group.MutableBoxes.Where(x => x.Order > removedOrder))
             following.Order--;
+        _pendingReplacementCounts[typeKey] = _pendingReplacementCounts.GetValueOrDefault(typeKey) + 1;
         _succeeded.Remove(boxNumber);
         _lastPlacements.Remove(boxNumber);
         return true;
@@ -190,6 +202,8 @@ public sealed class StackPlanner
         _group.MutableBoxes.Clear();
         _succeeded.Clear();
         _lastPlacements.Clear();
+        _pendingReplacementCounts.Clear();
+        _pendingReplacementBoxes.Clear();
         _lastPlan = new StackPlanResult { Placements = Array.Empty<BoxPlacement>(), PlanningResult = true };
         _hasGeneratedPlan = false;
     }
@@ -603,6 +617,251 @@ public sealed class StackPlanner
         Message = message,
     };
 
+
+    /// <summary>
+    /// 使用当前真实箱子集合执行有限数量的二维利用率规划，并直接返回逐箱堆垛数据。
+    /// 本方法复用 <see cref="PlanBestUtilization(IEnumerable{BoxDimension})" /> 的
+    /// 同高度分层、最多三种箱型组合和二维候选搜索思路，但不会调用正式的
+    /// <see cref="GeneratePlan()" />，也不会重新生成箱子数量或箱号。
+    /// </summary>
+    /// <remarks>
+    /// 利用率规划面向“当前仍在货架上的箱子集合”。调用方应在规划前完成箱子的增删；
+    /// 每个真实箱子最多使用一次，输出中的箱号和 Order 与当前集合保持对应。
+    /// </remarks>
+    public StackPlanResult GenerateBestUtilizationPlan()
+    {
+        ApplyPendingUtilizationOrders();
+        AssignOrders(preserveExistingOnShelf: true);
+        var boxes = _group.MutableBoxes
+            .Where(x => x.Status == BoxStatus.OnShelf)
+            .OrderBy(x => x.Order)
+            .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
+            .ToArray();
+
+        if (_group.MutableBoxes.Any(x => x.Status != BoxStatus.OnShelf))
+        {
+            _lastPlan = new StackPlanResult
+            {
+                Placements = Array.Empty<BoxPlacement>(),
+                PlanningResult = false,
+            };
+            _hasGeneratedPlan = true;
+            return ClonePlan(_lastPlan);
+        }
+
+        var remaining = boxes.ToList();
+        var placements = new List<BoxPlacement>();
+        double baseZ = 0;
+        int layerIndex = 0;
+        while (remaining.Count > 0)
+        {
+            var layerCandidates = new List<DirectBoxLayerResult>();
+            foreach (var heightGroup in remaining.GroupBy(x => x.HeightMm).OrderBy(x => x.Key))
+            {
+                if (baseZ + heightGroup.Key > StackMaxHeightMm + Epsilon)
+                    continue;
+
+                var typeKeys = heightGroup
+                    .Select(BoxTypeKey)
+                    .Distinct(StringComparer.Ordinal)
+                    .OrderBy(x => x, StringComparer.Ordinal)
+                    .ToArray();
+                foreach (var combination in TypeCombinations(typeKeys, 3))
+                {
+                    var candidate = FindBestFiniteDirectLayer(
+                        remaining.Where(x => combination.Contains(BoxTypeKey(x), StringComparer.Ordinal)).ToArray(),
+                        heightGroup.Key,
+                        combination.ToHashSet(StringComparer.Ordinal));
+                    if (candidate is not null)
+                        layerCandidates.Add(candidate);
+                }
+            }
+
+            var selected = layerCandidates
+                .OrderByDescending(x => x.OccupiedArea)
+                .ThenByDescending(x => x.Placements.Count)
+                .ThenBy(x => DirectBoxFragmentation(x.Placements))
+                .ThenBy(x => x.HeightMm)
+                .ThenBy(x => x.Signature, StringComparer.Ordinal)
+                .FirstOrDefault();
+            if (selected is null)
+                break;
+
+            foreach (var item in selected.Placements)
+            {
+                placements.Add(new BoxPlacement
+                {
+                    Order = item.Box.Order,
+                    BoxNumber = item.Box.BoxNumber,
+                    Xmm = Round(item.Xmm),
+                    Ymm = Round(item.Ymm),
+                    Zmm = Round(PlaceFloorZMm - baseZ - item.Box.HeightMm),
+                    OrientationDeg = item.OrientationDeg,
+                    LayerIndex = layerIndex,
+                });
+            }
+
+            var usedNumbers = selected.Placements
+                .Select(x => x.Box.BoxNumber)
+                .ToHashSet(StringComparer.Ordinal);
+            remaining.RemoveAll(x => usedNumbers.Contains(x.BoxNumber));
+            baseZ += selected.HeightMm;
+            layerIndex++;
+        }
+
+        var ordered = placements
+            .OrderBy(x => x.LayerIndex)
+            .ThenByDescending(x => x.Xmm)
+            .ThenByDescending(x => x.Ymm)
+            .ThenBy(x => x.Order)
+            .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
+            .ToArray();
+        foreach (var placement in ordered)
+            FindBox(placement.BoxNumber)!.Order = placement.Order;
+        _lastPlacements.Clear();
+        foreach (var placement in ordered)
+            _lastPlacements[placement.BoxNumber] = ClonePlacement(placement);
+        _lastPlan = new StackPlanResult
+        {
+            Placements = ordered,
+            PlanningResult = ordered.Length == boxes.Length,
+        };
+        _hasGeneratedPlan = true;
+        return ClonePlan(_lastPlan);
+    }
+
+    private DirectBoxLayerResult? FindBestFiniteDirectLayer(
+        IReadOnlyList<Box> boxes,
+        double heightMm,
+        IReadOnlySet<string> allowedTypeKeys)
+    {
+        if (boxes.Count == 0)
+            return null;
+
+        var frontier = new[] { new DirectBoxLayerState(Array.Empty<DirectBoxLayerPlacement>(), 0, boxes) };
+        DirectBoxLayerState? best = null;
+        for (int depth = 0; depth < boxes.Count && frontier.Length > 0; depth++)
+        {
+            var next = new List<DirectBoxLayerState>();
+            foreach (var state in frontier)
+            {
+                var representatives = state.Remaining
+                    .Where(x => allowedTypeKeys.Contains(BoxTypeKey(x)))
+                    .GroupBy(BoxTypeKey, StringComparer.Ordinal)
+                    .Select(group => group.OrderBy(x => x.Order).ThenBy(x => x.BoxNumber, StringComparer.Ordinal).First())
+                    .OrderBy(x => BoxTypeKey(x), StringComparer.Ordinal)
+                    .ToArray();
+                foreach (var candidate in GenerateFiniteDirectCandidates(representatives, state.Placements))
+                {
+                    if (state.Placements.Any(x => DirectBoxCollides(candidate, x)))
+                        continue;
+                    var remaining = state.Remaining
+                        .Where(x => !string.Equals(x.BoxNumber, candidate.Box.BoxNumber, StringComparison.Ordinal))
+                        .ToArray();
+                    next.Add(new DirectBoxLayerState(
+                        state.Placements.Concat(new[] { candidate }).ToArray(),
+                        state.OccupiedArea + candidate.Width * candidate.Length,
+                        remaining));
+                }
+            }
+
+            frontier = next
+                .OrderBy(x => MissingDirectBoxTypeCount(x, allowedTypeKeys))
+                .ThenByDescending(x => x.OccupiedArea)
+                .ThenByDescending(x => x.Placements.Count)
+                .ThenBy(x => DirectBoxFragmentation(x.Placements))
+                .ThenBy(DirectBoxSignature, StringComparer.Ordinal)
+                .Take(BeamWidth)
+                .ToArray();
+            var roundBest = frontier
+                .Where(x => MissingDirectBoxTypeCount(x, allowedTypeKeys) == 0)
+                .OrderByDescending(x => x.OccupiedArea)
+                .ThenByDescending(x => x.Placements.Count)
+                .ThenBy(x => DirectBoxFragmentation(x.Placements))
+                .ThenBy(DirectBoxSignature, StringComparer.Ordinal)
+                .FirstOrDefault();
+            if (roundBest is not null && (best is null || IsBetterFiniteDirectState(roundBest, best)))
+                best = roundBest;
+        }
+
+        return best is null || best.Placements.Count == 0
+            ? null
+            : new DirectBoxLayerResult(heightMm, best.Placements, best.OccupiedArea, DirectBoxSignature(best));
+    }
+
+    private IEnumerable<DirectBoxLayerPlacement> GenerateFiniteDirectCandidates(
+        IReadOnlyList<Box> boxes,
+        IReadOnlyList<DirectBoxLayerPlacement> placed)
+    {
+        foreach (var box in boxes)
+        foreach (var orientation in box.LengthMm == box.WidthMm ? new[] { 0 } : new[] { 0, 90 })
+        {
+            double width = orientation == 0 ? box.WidthMm : box.LengthMm;
+            double length = orientation == 0 ? box.LengthMm : box.WidthMm;
+            var xs = new SortedSet<double> { _palletXMinMm + width / 2 };
+            var ys = new SortedSet<double> { _palletYMinMm + length / 2 };
+            foreach (var item in placed)
+            {
+                xs.Add(item.Left - StackBoxGapMm - width / 2);
+                xs.Add(item.Right + StackBoxGapMm + width / 2);
+                ys.Add(item.Bottom - StackBoxGapMm - length / 2);
+                ys.Add(item.Top + StackBoxGapMm + length / 2);
+            }
+
+            foreach (var x in xs)
+            foreach (var y in ys)
+            {
+                var candidate = new DirectBoxLayerPlacement(box, x, y, width, length, orientation);
+                if (candidate.Left < _palletXMinMm - Epsilon || candidate.Right > _palletXMaxMm + Epsilon
+                    || candidate.Bottom < _palletYMinMm - Epsilon || candidate.Top > _palletYMaxMm + Epsilon)
+                    continue;
+                if (placed.Any(item => DirectBoxCollides(candidate, item)))
+                    continue;
+                yield return candidate;
+            }
+        }
+    }
+
+    private static int MissingDirectBoxTypeCount(
+        DirectBoxLayerState state,
+        IReadOnlySet<string> allowedTypeKeys)
+        => allowedTypeKeys.Count(type => !state.Placements.Any(x => BoxTypeKey(x.Box) == type));
+
+    private static bool IsBetterFiniteDirectState(DirectBoxLayerState candidate, DirectBoxLayerState current)
+        => candidate.OccupiedArea > current.OccupiedArea + Epsilon
+        || Math.Abs(candidate.OccupiedArea - current.OccupiedArea) <= Epsilon
+        && (candidate.Placements.Count > current.Placements.Count
+            || candidate.Placements.Count == current.Placements.Count
+            && string.CompareOrdinal(DirectBoxSignature(candidate), DirectBoxSignature(current)) < 0);
+
+    private static double DirectBoxFragmentation(IReadOnlyList<DirectBoxLayerPlacement> placements)
+    {
+        if (placements.Count == 0) return 0;
+        double left = placements.Min(x => x.Left);
+        double right = placements.Max(x => x.Right);
+        double bottom = placements.Min(x => x.Bottom);
+        double top = placements.Max(x => x.Top);
+        double area = placements.Sum(x => x.Width * x.Length);
+        return Math.Max(0, (right - left) * (top - bottom) - area);
+    }
+
+    private static string DirectBoxSignature(DirectBoxLayerState state)
+        => string.Join(";", state.Placements
+            .OrderBy(x => BoxTypeKey(x.Box), StringComparer.Ordinal)
+            .ThenBy(x => x.Xmm)
+            .ThenBy(x => x.Ymm)
+            .ThenBy(x => x.OrientationDeg)
+            .ThenBy(x => x.Box.BoxNumber, StringComparer.Ordinal)
+            .Select(x => string.Join("|", BoxTypeKey(x.Box),
+                x.Xmm.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+                x.Ymm.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+                x.OrientationDeg, x.Box.BoxNumber)));
+
+    private static bool DirectBoxCollides(DirectBoxLayerPlacement a, DirectBoxLayerPlacement b)
+        => a.Left - StackBoxGapMm / 2 < b.Right + StackBoxGapMm / 2 - Epsilon
+        && a.Right + StackBoxGapMm / 2 > b.Left - StackBoxGapMm / 2 + Epsilon
+        && a.Bottom - StackBoxGapMm / 2 < b.Top + StackBoxGapMm / 2 - Epsilon
+        && a.Top + StackBoxGapMm / 2 > b.Bottom - StackBoxGapMm / 2 + Epsilon;
     private double CalculateLayerUtilization(int layer)
     {
         double palletArea = (_palletXMaxMm - _palletXMinMm) * (_palletYMaxMm - _palletYMinMm);
@@ -650,18 +909,83 @@ public sealed class StackPlanner
         return copy;
     }
 
-    private void AssignOrders()
+    /// <summary>记录新增箱子是否匹配待补位的同规格删除箱。</summary>
+    private void RegisterReplacementBox(Box box)
+    {
+        string typeKey = BoxTypeKey(box);
+        if (!_pendingReplacementCounts.TryGetValue(typeKey, out int pendingCount) || pendingCount <= 0)
+            return;
+
+        if (pendingCount == 1)
+            _pendingReplacementCounts.Remove(typeKey);
+        else
+            _pendingReplacementCounts[typeKey] = pendingCount - 1;
+
+        if (!_pendingReplacementBoxes.TryGetValue(typeKey, out var boxNumbers))
+        {
+            boxNumbers = new HashSet<string>(StringComparer.Ordinal);
+            _pendingReplacementBoxes[typeKey] = boxNumbers;
+        }
+        boxNumbers.Add(box.BoxNumber);
+    }
+
+    /// <summary>
+    /// 仅为利用率规划应用同规格替换箱的末尾序号。
+    /// 不修改 GeneratePlan 使用的增删箱子顺序逻辑。
+    /// </summary>
+    private void ApplyPendingUtilizationOrders()
+    {
+        foreach (var entry in _pendingReplacementBoxes.ToArray())
+        {
+            string typeKey = entry.Key;
+            var replacementBoxes = _group.MutableBoxes
+                .Where(x => entry.Value.Contains(x.BoxNumber)
+                    && x.Status is not (BoxStatus.Stacking or BoxStatus.StackingSucceeded))
+                .ToArray();
+            if (replacementBoxes.Length == 0)
+                continue;
+
+            var eligible = _group.MutableBoxes
+                .Where(x => x.Status is not (BoxStatus.Stacking or BoxStatus.StackingSucceeded)
+                    && string.Equals(BoxTypeKey(x), typeKey, StringComparison.Ordinal)
+                    && !entry.Value.Contains(x.BoxNumber)
+                    && x.Order >= 0)
+                .ToArray();
+            int nextOrder = eligible.Select(x => x.Order).DefaultIfEmpty(-1).Max() + 1;
+            var usedOrders = _group.MutableBoxes.Where(x => x.Order >= 0).Select(x => x.Order).ToHashSet();
+            foreach (var box in replacementBoxes.OrderBy(x => x.BoxNumber, StringComparer.Ordinal))
+            {
+                while (usedOrders.Contains(nextOrder)) nextOrder++;
+                box.Order = nextOrder++;
+                usedOrders.Add(box.Order);
+            }
+
+            _pendingReplacementBoxes.Remove(typeKey);
+        }
+    }
+
+    private void AssignOrders(bool preserveExistingOnShelf = false)
     {
         // 非 OnShelf 箱子的 Order 是业务流程已经锁定的顺序，不能重新编号。
         // OnShelf 箱子严格按照加入集合的顺序分配顺序号，不再按箱型或箱号排序。
         var boxes = _group.MutableBoxes;
         if (boxes.Count > 0 && boxes.All(x => x.Status == BoxStatus.OnShelf))
         {
-            int order = 0;
-            foreach (var box in boxes)
+            if (!preserveExistingOnShelf)
             {
-                box.Order = order++;
+                int order = 0;
+                foreach (var box in boxes)
+                    box.Order = order++;
+                return;
             }
+
+            int nextOrder = boxes
+                .Where(x => x.Order >= 0)
+                .Select(x => x.Order)
+                .DefaultIfEmpty(-1)
+                .Max() + 1;
+            foreach (var box in boxes.Where(x => x.Order < 0))
+                box.Order = nextOrder++;
             return;
         }
         var used = boxes.Where(x => x.Status != BoxStatus.OnShelf && x.Order >= 0).Select(x => x.Order).ToHashSet();
@@ -1557,6 +1881,31 @@ public sealed class StackPlanner
     private sealed record DirectLayerResult(
         double HeightMm,
         IReadOnlyList<DirectLayerPlacement> Placements,
+        double OccupiedArea,
+        string Signature);
+    /// <summary>有限真实箱子的一层二维放置结果。</summary>
+    private sealed record DirectBoxLayerPlacement(
+        Box Box,
+        double Xmm,
+        double Ymm,
+        double Width,
+        double Length,
+        int OrientationDeg)
+    {
+        public double Left => Xmm - Width / 2;
+        public double Right => Xmm + Width / 2;
+        public double Bottom => Ymm - Length / 2;
+        public double Top => Ymm + Length / 2;
+    }
+    /// <summary>有限真实箱子的一层二维搜索状态。</summary>
+    private sealed record DirectBoxLayerState(
+        IReadOnlyList<DirectBoxLayerPlacement> Placements,
+        double OccupiedArea,
+        IReadOnlyList<Box> Remaining);
+    /// <summary>绑定真实箱子的单层二维布局候选。</summary>
+    private sealed record DirectBoxLayerResult(
+        double HeightMm,
+        IReadOnlyList<DirectBoxLayerPlacement> Placements,
         double OccupiedArea,
         string Signature);
     /// <summary>不同高度单层方案组合后的整垛结果。</summary>
