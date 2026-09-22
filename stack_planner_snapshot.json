@@ -1,0 +1,229 @@
+{
+  "schemaVersion": 1,
+  "revision": 23,
+  "updatedAtUtc": "2026-09-22T09:36:26.783702+00:00",
+  "boxes": [
+    {
+      "boxNumber": "0000334",
+      "weightKg": 12,
+      "lengthMm": 400,
+      "widthMm": 600,
+      "heightMm": 400,
+      "status": "OnShelf",
+      "order": 2
+    },
+    {
+      "boxNumber": "0000335",
+      "weightKg": 12,
+      "lengthMm": 400,
+      "widthMm": 600,
+      "heightMm": 400,
+      "status": "OnShelf",
+      "order": 3
+    },
+    {
+      "boxNumber": "0000336",
+      "weightKg": 12,
+      "lengthMm": 400,
+      "widthMm": 600,
+      "heightMm": 400,
+      "status": "OnShelf",
+      "order": 0
+    },
+    {
+      "boxNumber": "0000337",
+      "weightKg": 12,
+      "lengthMm": 400,
+      "widthMm": 600,
+      "heightMm": 400,
+      "status": "OnShelf",
+      "order": 1
+    },
+    {
+      "boxNumber": "0000338",
+      "weightKg": 12,
+      "lengthMm": 400,
+      "widthMm": 600,
+      "heightMm": 400,
+      "status": "OnShelf",
+      "order": 6
+    },
+    {
+      "boxNumber": "0000339",
+      "weightKg": 12,
+      "lengthMm": 400,
+      "widthMm": 600,
+      "heightMm": 400,
+      "status": "OnShelf",
+      "order": 7
+    },
+    {
+      "boxNumber": "0000340",
+      "weightKg": 12,
+      "lengthMm": 400,
+      "widthMm": 600,
+      "heightMm": 400,
+      "status": "OnShelf",
+      "order": 4
+    },
+    {
+      "boxNumber": "0000341",
+      "weightKg": 12,
+      "lengthMm": 400,
+      "widthMm": 600,
+      "heightMm": 400,
+      "status": "OnShelf",
+      "order": 5
+    },
+    {
+      "boxNumber": "0000342",
+      "weightKg": 12,
+      "lengthMm": 400,
+      "widthMm": 600,
+      "heightMm": 400,
+      "status": "OnShelf",
+      "order": 10
+    },
+    {
+      "boxNumber": "0000343",
+      "weightKg": 12,
+      "lengthMm": 400,
+      "widthMm": 600,
+      "heightMm": 400,
+      "status": "OnShelf",
+      "order": 11
+    },
+    {
+      "boxNumber": "0000344",
+      "weightKg": 12,
+      "lengthMm": 400,
+      "widthMm": 600,
+      "heightMm": 400,
+      "status": "OnShelf",
+      "order": 8
+    },
+    {
+      "boxNumber": "0000346",
+      "weightKg": 12,
+      "lengthMm": 400,
+      "widthMm": 600,
+      "heightMm": 400,
+      "status": "OnShelf",
+      "order": 11
+    }
+  ],
+  "plan": {
+    "placements": [
+      {
+        "order": 0,
+        "boxNumber": "0000336",
+        "xmm": 2120,
+        "ymm": -700,
+        "zmm": 1400,
+        "orientationDeg": 90,
+        "layerIndex": 0
+      },
+      {
+        "order": 1,
+        "boxNumber": "0000337",
+        "xmm": 2020,
+        "ymm": -180,
+        "zmm": 1400,
+        "orientationDeg": 0,
+        "layerIndex": 0
+      },
+      {
+        "order": 2,
+        "boxNumber": "0000334",
+        "xmm": 1600,
+        "ymm": -800,
+        "zmm": 1400,
+        "orientationDeg": 0,
+        "layerIndex": 0
+      },
+      {
+        "order": 3,
+        "boxNumber": "0000335",
+        "xmm": 1500,
+        "ymm": -280,
+        "zmm": 1400,
+        "orientationDeg": 90,
+        "layerIndex": 0
+      },
+      {
+        "order": 4,
+        "boxNumber": "0000340",
+        "xmm": 2120,
+        "ymm": -700,
+        "zmm": 1000,
+        "orientationDeg": 90,
+        "layerIndex": 1
+      },
+      {
+        "order": 5,
+        "boxNumber": "0000341",
+        "xmm": 2020,
+        "ymm": -180,
+        "zmm": 1000,
+        "orientationDeg": 0,
+        "layerIndex": 1
+      },
+      {
+        "order": 6,
+        "boxNumber": "0000338",
+        "xmm": 1600,
+        "ymm": -800,
+        "zmm": 1000,
+        "orientationDeg": 0,
+        "layerIndex": 1
+      },
+      {
+        "order": 7,
+        "boxNumber": "0000339",
+        "xmm": 1500,
+        "ymm": -280,
+        "zmm": 1000,
+        "orientationDeg": 90,
+        "layerIndex": 1
+      },
+      {
+        "order": 8,
+        "boxNumber": "0000344",
+        "xmm": 2120,
+        "ymm": -700,
+        "zmm": 600,
+        "orientationDeg": 90,
+        "layerIndex": 2
+      },
+      {
+        "order": 9,
+        "boxNumber": "0000342",
+        "xmm": 2020,
+        "ymm": -180,
+        "zmm": 600,
+        "orientationDeg": 0,
+        "layerIndex": 2
+      },
+      {
+        "order": 10,
+        "boxNumber": "0000343",
+        "xmm": 1600,
+        "ymm": -800,
+        "zmm": 600,
+        "orientationDeg": 0,
+        "layerIndex": 2
+      },
+      {
+        "order": 11,
+        "boxNumber": "0000346",
+        "xmm": 1500,
+        "ymm": -280,
+        "zmm": 600,
+        "orientationDeg": 90,
+        "layerIndex": 2
+      }
+    ],
+    "planningResult": true
+  },
+  "reusablePlacements": []
+}

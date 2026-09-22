@@ -38,9 +38,10 @@ public sealed record Box
     /// <summary>当前业务状态；新箱子默认为 <see cref="BoxStatus.OnShelf" />。</summary>
     public BoxStatus Status { get; set; } = BoxStatus.OnShelf;
     /// <summary>
-    /// 堆垛顺序，从 0 开始；-1 表示尚未分配。
+    /// 当前规划中的堆垛顺序，从 0 开始；-1 表示尚未分配。
+    /// 正常规划完成后，该值等于规划结果 Placements 数组中对应项的下标。
     /// <see cref="BoxStatus.Stacking" /> 和 <see cref="BoxStatus.StackingSucceeded" />
-    /// 箱子的顺序视为已锁定；其他未锁定箱子可在同规格替换时调整。
+    /// 箱子的顺序视为已锁定；其他未锁定箱子可在重新规划时调整。
     /// </summary>
     public int Order { get; set; } = -1;
 }
@@ -64,7 +65,7 @@ public sealed class BoxGroup
 /// </summary>
 public sealed record BoxPlacement
 {
-    /// <summary>该箱子的堆垛顺序。</summary>
+    /// <summary>该箱子在所属规划结果 Placements 数组中的下标，从 0 开始。</summary>
     public required int Order { get; init; }
     /// <summary>该位置对应的唯一箱号。</summary>
     public required string BoxNumber { get; init; }
@@ -90,6 +91,49 @@ public sealed class StackPlanResult
     public required IReadOnlyList<BoxPlacement> Placements { get; init; }
     /// <summary>所有箱子都成功获得合法位置时为 true，否则为 false。</summary>
     public required bool PlanningResult { get; init; }
+}
+
+/// <summary>
+/// Core 对外发布的完整状态快照，用于跨进程显示和状态恢复。
+/// </summary>
+public sealed class PlannerSnapshot
+{
+    /// <summary>快照文件结构版本。</summary>
+    public int SchemaVersion { get; init; } = 1;
+    /// <summary>同一快照文件内单调递增的版本号。</summary>
+    public required long Revision { get; init; }
+    /// <summary>快照发布时间（UTC）。</summary>
+    public required DateTimeOffset UpdatedAtUtc { get; init; }
+    /// <summary>Core 当前维护的完整箱子集合。</summary>
+    public required IReadOnlyList<Box> Boxes { get; init; }
+    /// <summary>Core 当前维护的规划结果。</summary>
+    public required StackPlanResult Plan { get; init; }
+    /// <summary>利用率规划删除箱子后保留的可复用位置。</summary>
+    public required IReadOnlyList<ReusablePlacementSet> ReusablePlacements { get; init; }
+}
+
+/// <summary>按完整尺寸归类的可复用规划位置。</summary>
+public sealed class ReusablePlacementSet
+{
+    /// <summary>可复用位置所属的箱子完整尺寸。</summary>
+    public required BoxDimension Dimension { get; init; }
+    /// <summary>按规划顺序排列的可复用位置。</summary>
+    public required IReadOnlyList<BoxPlacement> Placements { get; init; }
+}
+
+/// <summary>利用率规划加减箱操作结果。</summary>
+public sealed class UtilizationMutationResult
+{
+    /// <summary>本次操作是否成功。</summary>
+    public required bool Succeeded { get; init; }
+    /// <summary>Core 返回的操作说明。</summary>
+    public required string Message { get; init; }
+    /// <summary>操作完成后的箱子集合。</summary>
+    public required IReadOnlyList<Box> Boxes { get; init; }
+    /// <summary>操作完成后的规划快照。</summary>
+    public required StackPlanResult Plan { get; init; }
+    /// <summary>操作完成后仍可复用的规划位置。</summary>
+    public required IReadOnlyList<ReusablePlacementSet> ReusablePlacements { get; init; }
 }
 
 /// <summary>仅由箱体尺寸描述的候选箱型。</summary>

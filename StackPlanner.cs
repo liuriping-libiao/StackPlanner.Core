@@ -43,6 +43,8 @@ public sealed class StackPlanner
     private readonly Dictionary<string, int> _pendingReplacementCounts = new(StringComparer.Ordinal);
     /// <summary>匹配删除记录、等待在利用率规划中追加到同规格末尾的新箱号。</summary>
     private readonly Dictionary<string, HashSet<string>> _pendingReplacementBoxes = new(StringComparer.Ordinal);
+    /// <summary>删除后保留的、可供同规格新箱复用的规划位置。</summary>
+    private readonly Dictionary<string, List<BoxPlacement>> _reusableUtilizationPlacements = new(StringComparer.Ordinal);
     /// <summary>对外返回的最近一次规划结果。</summary>
     private StackPlanResult _lastPlan = new() { Placements = Array.Empty<BoxPlacement>(), PlanningResult = true };
 
@@ -126,6 +128,85 @@ public sealed class StackPlanner
     /// <summary>获取最近一次规划结果的副本。</summary>
     public StackPlanResult CurrentPlan => ClonePlan(_lastPlan);
 
+    /// <summary>生成当前箱子集合和规划数据的不可变快照。</summary>
+    public PlannerSnapshot CreateSnapshot() => new()
+    {
+        Revision = 0,
+        UpdatedAtUtc = DateTimeOffset.UtcNow,
+        Boxes = GetBoxes(),
+        Plan = CurrentPlan,
+        ReusablePlacements = ExportReusablePlacements(),
+    };
+
+    /// <summary>将当前完整状态原子发布到本地快照文件。</summary>
+    public PlannerSnapshot SaveSnapshot(string filePath)
+        => PlannerSnapshotStore.Save(filePath, CreateSnapshot());
+
+    /// <summary>
+    /// 从完整快照恢复 Core 状态。恢复前会校验箱号、箱子属性和规划引用关系。
+    /// </summary>
+    public void RestoreSnapshot(PlannerSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        if (snapshot.SchemaVersion != 1)
+            throw new InvalidDataException($"不支持的规划快照版本：{snapshot.SchemaVersion}");
+
+        var boxes = snapshot.Boxes.Select(CloneBox).ToArray();
+        var numbers = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var box in boxes)
+        {
+            ValidateBox(box);
+            if (!numbers.Add(box.BoxNumber))
+                throw new InvalidDataException($"规划快照包含重复箱号：{box.BoxNumber}");
+        }
+
+        var placements = snapshot.Plan.Placements.Select(ClonePlacement).ToArray();
+        if (placements.Any(x => !numbers.Contains(x.BoxNumber))
+            || placements.Select(x => x.BoxNumber).Distinct(StringComparer.Ordinal).Count() != placements.Length)
+            throw new InvalidDataException("规划快照中的放置结果包含未知或重复箱号。");
+
+        _group.MutableBoxes.Clear();
+        _group.MutableBoxes.AddRange(boxes);
+        _succeeded.Clear();
+        _lastPlacements.Clear();
+        _pendingReplacementCounts.Clear();
+        _pendingReplacementBoxes.Clear();
+        _reusableUtilizationPlacements.Clear();
+
+        foreach (var placement in placements)
+            _lastPlacements[placement.BoxNumber] = placement;
+        foreach (var box in boxes.Where(x => x.Status == BoxStatus.StackingSucceeded))
+        {
+            if (!_lastPlacements.TryGetValue(box.BoxNumber, out var placement))
+                throw new InvalidDataException($"堆垛成功箱子缺少固定位置：{box.BoxNumber}");
+            _succeeded[box.BoxNumber] = new FixedPlacement(
+                ClonePlacement(placement), box.LengthMm, box.WidthMm, box.HeightMm);
+        }
+        foreach (var reusableSet in snapshot.ReusablePlacements)
+        {
+            string key = BoxTypeKey(new Box
+            {
+                BoxNumber = "snapshot-dimension",
+                LengthMm = reusableSet.Dimension.LengthMm,
+                WidthMm = reusableSet.Dimension.WidthMm,
+                HeightMm = reusableSet.Dimension.HeightMm,
+            });
+            _reusableUtilizationPlacements[key] = reusableSet.Placements
+                .Select(ClonePlacement)
+                .ToList();
+        }
+
+        _lastPlan = new StackPlanResult
+        {
+            Placements = placements,
+            PlanningResult = snapshot.Plan.PlanningResult,
+        };
+        _hasGeneratedPlan = placements.Length > 0 || boxes.Length == 0;
+    }
+
+    /// <summary>从本地快照文件恢复 Core 状态。</summary>
+    public void LoadSnapshot(string filePath) => RestoreSnapshot(PlannerSnapshotStore.Load(filePath));
+
     /// <summary>
     /// 增加一个新箱子。
     /// 新增箱子必须处于 OnShelf 状态，重复箱号不会覆盖已有箱子。
@@ -191,6 +272,71 @@ public sealed class StackPlanner
         _succeeded.Remove(boxNumber);
         _lastPlacements.Remove(boxNumber);
         return true;
+    }
+
+    /// <summary>
+    /// 不重新规划地增加一个箱子。
+    /// 新箱子只能使用此前减箱释放的同尺寸规划位置；没有可复用位置时不会增加箱子。
+    /// </summary>
+    /// <param name="box">待增加的箱子，必须处于 OnShelf 状态。</param>
+    /// <returns>增加结果，以及操作后的完整箱子集合和规划快照。</returns>
+    public UtilizationMutationResult AddBoxWithoutReplanning(Box box)
+    {
+        ArgumentNullException.ThrowIfNull(box);
+        ValidateBox(box);
+
+        if (box.Status != BoxStatus.OnShelf)
+            return MutationFailure("新增箱子必须处于 OnShelf 状态。");
+        if (_group.MutableBoxes.Any(x => string.Equals(x.BoxNumber, box.BoxNumber, StringComparison.Ordinal)))
+            return MutationFailure($"箱号已存在：{box.BoxNumber}。");
+        if (!_lastPlan.PlanningResult || _lastPlacements.Count != _group.MutableBoxes.Count)
+            return MutationFailure("当前没有完整有效的利用率规划，不能不重新规划地加箱。");
+
+        string key = BoxTypeKey(box);
+        if (!_reusableUtilizationPlacements.TryGetValue(key, out var reusable)
+            || reusable.Count == 0)
+            return MutationFailure($"尺寸 {key} 没有可复用的规划位置，不能不重新规划地加箱。");
+
+        var added = CloneBox(box);
+        var source = reusable[0];
+        reusable.RemoveAt(0);
+        _group.MutableBoxes.Add(added);
+
+        var placement = source with
+        {
+            BoxNumber = added.BoxNumber,
+            Order = _lastPlan.Placements.Count,
+        };
+        added.Order = placement.Order;
+        _lastPlacements[added.BoxNumber] = placement;
+        _lastPlan = new StackPlanResult
+        {
+            Placements = _lastPlan.Placements.Concat(new[] { placement }).ToArray(),
+            PlanningResult = true,
+        };
+        _hasGeneratedPlan = true;
+        return MutationSuccess("不重新规划地加箱完成。");
+    }
+
+    /// <summary>
+    /// 不重新规划地删除一个箱子。
+    /// 删除后，同尺寸箱子依次使用前一个箱子的规划位置，并保留最后释放的位置供加箱复用。
+    /// </summary>
+    /// <param name="box">待删除的箱子；仅使用其 BoxNumber 定位 Core 内部箱子。</param>
+    /// <returns>删除结果，以及操作后的完整箱子集合和规划快照。</returns>
+    public UtilizationMutationResult RemoveBoxWithoutReplanning(Box box)
+    {
+        ArgumentNullException.ThrowIfNull(box);
+        var existing = FindBox(box.BoxNumber);
+        if (existing is null)
+            return MutationFailure($"箱号不存在：{box.BoxNumber}。");
+        if (existing.Status is BoxStatus.Stacking or BoxStatus.StackingSucceeded)
+            return MutationFailure("堆垛中或堆垛成功的箱子不能删除。");
+        if (!_lastPlan.PlanningResult || _lastPlacements.Count != _group.MutableBoxes.Count)
+            return MutationFailure("当前没有完整有效的利用率规划，不能不重新规划地减箱。");
+
+        RemoveUtilizationBox(existing.BoxNumber);
+        return MutationSuccess("不重新规划地减箱完成。");
     }
 
     /// <summary>
@@ -332,6 +478,7 @@ public sealed class StackPlanner
         success &= searched.Placements.Count == onShelf.Length;
 
         var placements = output.Values.OrderBy(x => x.Order).ThenBy(x => x.BoxNumber, StringComparer.Ordinal).ToArray();
+        placements = NormalizePlacementOrders(placements);
         foreach (var placement in placements)
         {
             var box = FindBox(placement.BoxNumber)!;
@@ -716,6 +863,7 @@ public sealed class StackPlanner
             .ThenBy(x => x.Order)
             .ThenBy(x => x.BoxNumber, StringComparer.Ordinal)
             .ToArray();
+        ordered = NormalizePlacementOrders(ordered);
         foreach (var placement in ordered)
             FindBox(placement.BoxNumber)!.Order = placement.Order;
         _lastPlacements.Clear();
@@ -962,6 +1110,111 @@ public sealed class StackPlanner
 
             _pendingReplacementBoxes.Remove(typeKey);
         }
+    }
+
+    private void RemoveUtilizationBox(string boxNumber)
+    {
+        var removed = FindBox(boxNumber)!;
+        string removedKey = BoxTypeKey(removed);
+        var oldPlacements = _lastPlan.Placements.ToArray();
+        var groups = oldPlacements
+            .Where(point => FindBox(point.BoxNumber) is not null)
+            .GroupBy(point => BoxTypeKey(FindBox(point.BoxNumber)!), StringComparer.Ordinal)
+            .ToArray();
+        var replacements = new Dictionary<string, BoxPlacement>(StringComparer.Ordinal);
+
+        foreach (var group in groups)
+        {
+            var points = group.ToArray();
+            var survivors = points
+                .Where(point => !string.Equals(point.BoxNumber, boxNumber, StringComparison.Ordinal))
+                .ToArray();
+            var sourcePoints = points
+                .Where(point => !string.Equals(point.BoxNumber, boxNumber, StringComparison.Ordinal))
+                .ToArray();
+            if (string.Equals(group.Key, removedKey, StringComparison.Ordinal))
+            {
+                sourcePoints = points;
+                for (int i = 0; i < survivors.Length; i++)
+                    replacements[survivors[i].BoxNumber] = sourcePoints[i] with
+                    {
+                        BoxNumber = survivors[i].BoxNumber,
+                    };
+                if (points.Length > survivors.Length)
+                {
+                    var tail = sourcePoints[^1];
+                    _reusableUtilizationPlacements
+                        .GetValueOrDefault(removedKey, new List<BoxPlacement>())
+                        .Add(tail);
+                    if (!_reusableUtilizationPlacements.ContainsKey(removedKey))
+                        _reusableUtilizationPlacements[removedKey] = new List<BoxPlacement> { tail };
+                }
+            }
+        }
+
+        _group.MutableBoxes.Remove(removed);
+        _lastPlacements.Clear();
+        foreach (var point in oldPlacements)
+        {
+            if (string.Equals(point.BoxNumber, boxNumber, StringComparison.Ordinal))
+                continue;
+            var replacement = replacements.GetValueOrDefault(point.BoxNumber, point);
+            _lastPlacements[replacement.BoxNumber] = replacement;
+        }
+        _lastPlan = new StackPlanResult
+        {
+            Placements = oldPlacements
+                .Where(point => !string.Equals(point.BoxNumber, boxNumber, StringComparison.Ordinal))
+                .Select(point => replacements.GetValueOrDefault(point.BoxNumber, point))
+                .ToArray(),
+            PlanningResult = true,
+        };
+    }
+
+    private static BoxPlacement[] NormalizePlacementOrders(IReadOnlyList<BoxPlacement> placements)
+        => placements
+            .Select((placement, index) => placement with { Order = index })
+            .ToArray();
+
+    private UtilizationMutationResult MutationSuccess(string message)
+        => new()
+        {
+            Succeeded = true,
+            Message = message,
+            Boxes = GetBoxes(),
+            Plan = CurrentPlan,
+            ReusablePlacements = ExportReusablePlacements(),
+        };
+
+    private UtilizationMutationResult MutationFailure(string message)
+        => new()
+        {
+            Succeeded = false,
+            Message = message,
+            Boxes = GetBoxes(),
+            Plan = CurrentPlan,
+            ReusablePlacements = ExportReusablePlacements(),
+        };
+
+    private IReadOnlyList<ReusablePlacementSet> ExportReusablePlacements()
+        => _reusableUtilizationPlacements
+            .Where(entry => entry.Value.Count > 0)
+            .Select(entry => new ReusablePlacementSet
+            {
+                Dimension = ParseDimensionKey(entry.Key),
+                Placements = entry.Value.Select(ClonePlacement).ToArray(),
+            })
+            .ToArray();
+
+    private static BoxDimension ParseDimensionKey(string key)
+    {
+        var values = key.Split('x');
+        return new BoxDimension
+        {
+            LengthMm = double.Parse(values[0], System.Globalization.CultureInfo.InvariantCulture),
+            WidthMm = double.Parse(values[1], System.Globalization.CultureInfo.InvariantCulture),
+            HeightMm = double.Parse(values[2], System.Globalization.CultureInfo.InvariantCulture),
+        };
     }
 
     private void AssignOrders(bool preserveExistingOnShelf = false)
