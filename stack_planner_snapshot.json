@@ -1,114 +1,150 @@
 {
   "schemaVersion": 1,
-  "revision": 23,
-  "updatedAtUtc": "2026-09-22T09:36:26.783702+00:00",
+  "revision": 288,
+  "updatedAtUtc": "2026-09-22T13:40:31.4765551+00:00",
   "boxes": [
     {
-      "boxNumber": "0000334",
+      "boxNumber": "0000012",
+      "weightKg": 9,
+      "lengthMm": 360,
+      "widthMm": 420,
+      "heightMm": 270,
+      "status": "StackingSucceeded",
+      "order": 15
+    },
+    {
+      "boxNumber": "0000013",
+      "weightKg": 9,
+      "lengthMm": 360,
+      "widthMm": 420,
+      "heightMm": 270,
+      "status": "Stacking",
+      "order": 14
+    },
+    {
+      "boxNumber": "0000014",
+      "weightKg": 9,
+      "lengthMm": 360,
+      "widthMm": 420,
+      "heightMm": 270,
+      "status": "StackingSucceeded",
+      "order": 13
+    },
+    {
+      "boxNumber": "0000015",
+      "weightKg": 9,
+      "lengthMm": 360,
+      "widthMm": 420,
+      "heightMm": 270,
+      "status": "StackingSucceeded",
+      "order": 12
+    },
+    {
+      "boxNumber": "0000016",
       "weightKg": 12,
       "lengthMm": 400,
       "widthMm": 600,
       "heightMm": 400,
-      "status": "OnShelf",
+      "status": "StackingSucceeded",
       "order": 2
     },
     {
-      "boxNumber": "0000335",
+      "boxNumber": "0000017",
       "weightKg": 12,
       "lengthMm": 400,
       "widthMm": 600,
       "heightMm": 400,
-      "status": "OnShelf",
+      "status": "StackingSucceeded",
       "order": 3
     },
     {
-      "boxNumber": "0000336",
+      "boxNumber": "0000018",
       "weightKg": 12,
       "lengthMm": 400,
       "widthMm": 600,
       "heightMm": 400,
-      "status": "OnShelf",
+      "status": "StackingSucceeded",
       "order": 0
     },
     {
-      "boxNumber": "0000337",
+      "boxNumber": "0000019",
       "weightKg": 12,
       "lengthMm": 400,
       "widthMm": 600,
       "heightMm": 400,
-      "status": "OnShelf",
+      "status": "StackingSucceeded",
       "order": 1
     },
     {
-      "boxNumber": "0000338",
+      "boxNumber": "0000021",
       "weightKg": 12,
       "lengthMm": 400,
       "widthMm": 600,
       "heightMm": 400,
-      "status": "OnShelf",
-      "order": 6
-    },
-    {
-      "boxNumber": "0000339",
-      "weightKg": 12,
-      "lengthMm": 400,
-      "widthMm": 600,
-      "heightMm": 400,
-      "status": "OnShelf",
+      "status": "StackingSucceeded",
       "order": 7
     },
     {
-      "boxNumber": "0000340",
+      "boxNumber": "0000022",
       "weightKg": 12,
       "lengthMm": 400,
       "widthMm": 600,
       "heightMm": 400,
-      "status": "OnShelf",
+      "status": "StackingSucceeded",
       "order": 4
     },
     {
-      "boxNumber": "0000341",
+      "boxNumber": "0000023",
       "weightKg": 12,
       "lengthMm": 400,
       "widthMm": 600,
       "heightMm": 400,
-      "status": "OnShelf",
+      "status": "StackingSucceeded",
       "order": 5
     },
     {
-      "boxNumber": "0000342",
+      "boxNumber": "0000024",
       "weightKg": 12,
       "lengthMm": 400,
       "widthMm": 600,
       "heightMm": 400,
-      "status": "OnShelf",
+      "status": "StackingSucceeded",
       "order": 10
     },
     {
-      "boxNumber": "0000343",
+      "boxNumber": "0000025",
       "weightKg": 12,
       "lengthMm": 400,
       "widthMm": 600,
       "heightMm": 400,
-      "status": "OnShelf",
+      "status": "StackingSucceeded",
       "order": 11
     },
     {
-      "boxNumber": "0000344",
+      "boxNumber": "0000026",
       "weightKg": 12,
       "lengthMm": 400,
       "widthMm": 600,
       "heightMm": 400,
-      "status": "OnShelf",
+      "status": "StackingSucceeded",
       "order": 8
     },
     {
-      "boxNumber": "0000346",
+      "boxNumber": "0000027",
       "weightKg": 12,
       "lengthMm": 400,
       "widthMm": 600,
       "heightMm": 400,
-      "status": "OnShelf",
+      "status": "StackingSucceeded",
+      "order": 9
+    },
+    {
+      "boxNumber": "0000028",
+      "weightKg": 12,
+      "lengthMm": 400,
+      "widthMm": 600,
+      "heightMm": 400,
+      "status": "StackingSucceeded",
       "order": 11
     }
   ],
@@ -116,7 +152,7 @@
     "placements": [
       {
         "order": 0,
-        "boxNumber": "0000336",
+        "boxNumber": "0000018",
         "xmm": 2120,
         "ymm": -700,
         "zmm": 1400,
@@ -125,7 +161,7 @@
       },
       {
         "order": 1,
-        "boxNumber": "0000337",
+        "boxNumber": "0000019",
         "xmm": 2020,
         "ymm": -180,
         "zmm": 1400,
@@ -134,7 +170,7 @@
       },
       {
         "order": 2,
-        "boxNumber": "0000334",
+        "boxNumber": "0000016",
         "xmm": 1600,
         "ymm": -800,
         "zmm": 1400,
@@ -143,7 +179,7 @@
       },
       {
         "order": 3,
-        "boxNumber": "0000335",
+        "boxNumber": "0000017",
         "xmm": 1500,
         "ymm": -280,
         "zmm": 1400,
@@ -152,7 +188,7 @@
       },
       {
         "order": 4,
-        "boxNumber": "0000340",
+        "boxNumber": "0000022",
         "xmm": 2120,
         "ymm": -700,
         "zmm": 1000,
@@ -161,7 +197,7 @@
       },
       {
         "order": 5,
-        "boxNumber": "0000341",
+        "boxNumber": "0000023",
         "xmm": 2020,
         "ymm": -180,
         "zmm": 1000,
@@ -170,7 +206,7 @@
       },
       {
         "order": 6,
-        "boxNumber": "0000338",
+        "boxNumber": "0000021",
         "xmm": 1600,
         "ymm": -800,
         "zmm": 1000,
@@ -179,7 +215,7 @@
       },
       {
         "order": 7,
-        "boxNumber": "0000339",
+        "boxNumber": "0000026",
         "xmm": 1500,
         "ymm": -280,
         "zmm": 1000,
@@ -188,7 +224,7 @@
       },
       {
         "order": 8,
-        "boxNumber": "0000344",
+        "boxNumber": "0000027",
         "xmm": 2120,
         "ymm": -700,
         "zmm": 600,
@@ -197,7 +233,7 @@
       },
       {
         "order": 9,
-        "boxNumber": "0000342",
+        "boxNumber": "0000024",
         "xmm": 2020,
         "ymm": -180,
         "zmm": 600,
@@ -206,7 +242,7 @@
       },
       {
         "order": 10,
-        "boxNumber": "0000343",
+        "boxNumber": "0000025",
         "xmm": 1600,
         "ymm": -800,
         "zmm": 600,
@@ -215,12 +251,48 @@
       },
       {
         "order": 11,
-        "boxNumber": "0000346",
+        "boxNumber": "0000028",
         "xmm": 1500,
         "ymm": -280,
         "zmm": 600,
         "orientationDeg": 90,
         "layerIndex": 2
+      },
+      {
+        "order": 12,
+        "boxNumber": "0000015",
+        "xmm": 1860,
+        "ymm": -350,
+        "zmm": 330,
+        "orientationDeg": 90,
+        "layerIndex": 3
+      },
+      {
+        "order": 13,
+        "boxNumber": "0000014",
+        "xmm": 1860,
+        "ymm": -790,
+        "zmm": 330,
+        "orientationDeg": 90,
+        "layerIndex": 3
+      },
+      {
+        "order": 14,
+        "boxNumber": "0000013",
+        "xmm": 1480,
+        "ymm": -350,
+        "zmm": 330,
+        "orientationDeg": 90,
+        "layerIndex": 3
+      },
+      {
+        "order": 15,
+        "boxNumber": "0000012",
+        "xmm": 1480,
+        "ymm": -790,
+        "zmm": 330,
+        "orientationDeg": 90,
+        "layerIndex": 3
       }
     ],
     "planningResult": true

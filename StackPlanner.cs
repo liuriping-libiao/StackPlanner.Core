@@ -298,20 +298,22 @@ public sealed class StackPlanner
             return MutationFailure($"尺寸 {key} 没有可复用的规划位置，不能不重新规划地加箱。");
 
         var added = CloneBox(box);
-        var source = reusable[0];
-        reusable.RemoveAt(0);
+        var source = reusable.MinBy(point => point.Order)!;
+        reusable.Remove(source);
         _group.MutableBoxes.Add(added);
 
         var placement = source with
         {
             BoxNumber = added.BoxNumber,
-            Order = _lastPlan.Placements.Count,
         };
         added.Order = placement.Order;
         _lastPlacements[added.BoxNumber] = placement;
         _lastPlan = new StackPlanResult
         {
-            Placements = _lastPlan.Placements.Concat(new[] { placement }).ToArray(),
+            Placements = _lastPlan.Placements
+                .Append(placement)
+                .OrderBy(point => point.Order)
+                .ToArray(),
             PlanningResult = true,
         };
         _hasGeneratedPlan = true;
